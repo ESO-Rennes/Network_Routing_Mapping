@@ -2,6 +2,8 @@
 
 This work was carried out by [Hugo Thomas](https://perso.univ-rennes2.fr/hugo.thomas) and [Florent Demoraes](https://perso.univ-rennes2.fr/florent.demoraes) at the CNRS ESO research unit in Rennes (France), between June and December 2023. This study is part of a PhD thesis developed by Hugo Thomas (Université Rennes 2, France / Universidad de los Andes, Colombia) and also part of the activities of the [Modural program](https://modural.hypotheses.org/le-projet) funded by the French National Research Agency. The methods developed in R and applied to Bogotá and Lima are replicable to other urban areas and other mobility surveys using other travel modes.
 
+![PKT Bogota](Bogota Smoothed map total distance-1.png) 
+
 # Routing shortest path distance in road and public transport networks
 
 This repository contains scripts and data to carry out network-based distance computation based on a Household Travel Survey conducted in 2019 (HMS 2019) in Bogotá, and a Household Travel Survey conducted in 2012 (HMS 2012) in Lima. The analysis uses database representing 22,000 households and 120,000 trips in each city, as well as road and public transport networks downloaded from OpenStreetMap or open data repositories. The main outputs of this section are the trips databases of both cities with an additional variable accounting for the length of  each trip. 
