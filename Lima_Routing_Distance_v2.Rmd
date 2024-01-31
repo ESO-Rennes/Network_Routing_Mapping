@@ -1,0 +1,1602 @@
+---
+title: "Lima_Routing_Distance_v4"
+author: "[Hugo Thomas](https://perso.univ-rennes2.fr/hugo.thomas)"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    code_folding: "hide"
+---
+
+# Introduction
+
+This Markdown does the following:
+
+* Counting the number of occurrences of each OD pair in the trips database and producing a heatmap. 
+* Providing a sensibility test of the location of the start and end point in each ZAT.
+* Computing distance for each trip on the database, for all possible modes.
+* Producing basic statistics about distance in Lima.
+* Showing trip examples.
+
+# Preliminary work
+
+## Defining the working environment
+
+```{r setup, include=FALSE}
+    knitr::opts_chunk$set(warning = FALSE, message = FALSE, verbose = FALSE)
+    knitr::opts_chunk$set(dev = "png",
+                          dpi = 300,
+                          echo = TRUE,
+                          cache = TRUE)
+```
+
+For the moment the data is stored locally. We will further put a link to download the data.
+```{r}
+setwd("C:/Users/hugot/Documents/Rennes 2/Calcul distance SIG/Reprise perso/RMD Lima")
+```
+
+## Loading packages
+
+```{r}
+library(sfnetworks)
+library(dodgr)
+library(sf)
+library(sp)
+library(tidygraph)
+library(data.table)
+library(dplyr)
+library(purrr)
+library(TSP)
+library(openxlsx)
+library(terra)
+library(ggplot2)
+library(ggspatial)
+library(knitr)
+library(tidyr)
+library(foreach)
+library(doFuture)
+```
+
+
+## Loading the data
+
+This Markdown requires at least the following inputs (to be used with the _sfnetworks_ and _dodgr_ packages):
+
+* a trip table (.xlsx or .csv) from an urban mobility survey with, for each trip: 
+  + the zone of origin and the zone of destination
+  + the main mode
+* a .shp file with the boundaries of the zones.
+* a .shp file with the following networks: road, metro, BRT, Bus, Custer, Combi.
+
+
+All data source are open wis CRS WGS 84 (EPSG:4326) and converted if necessary.
+
+```{r opening files}
+viajes <- read.xlsx("Data/ViajesOK.xlsx")                           # Urban mobility survey (trip table)
+Routes <- st_read(dsn = "Data", layer = "Reseau_routier_2010")      # Road network
+Metro <- st_read(dsn = "Data", layer = "Metro1_connected")          # Metro line 1
+Metro_stops <- st_read(dsn = "Data", layer = "Metro_estaciones")    # Metro line 1 stops
+BRT <- st_read(dsn = "Data", layer = "MetropolitanoAlimentador")    # BRT network
+BRT_stops <- st_read(dsn = "Data", layer = "MetropolitanoAlimentador_estaciones") #BRT stops 
+Bus <- st_read(dsn = "Data", layer = "Bus")                         # Bus lines
+Custer <- st_read(dsn = "Data", layer = "Custer")                   # Custer lines
+Combi <- st_read(dsn = "Data", layer = "Combi")                     # Combi lines
+ZAT <- st_read(dsn = "Data", layer = "ZAT")                         # ZAT boundaries
+ZAT_urban <- st_read(dsn = "Data", layer = "ZAT_solo_mancha_urbana")# urban part of the ZAT
+Direccion <- st_read(dsn = "Data", layer = "Dir_hogares")           # Household address
+People <- read.xlsx("Data/Personas.xlsx")                           # Weighted people table
+contour <- st_read(dsn = "Data", layer = "contour")                 # edge of the city
+```
+
+Data source:
+
+
+Dataset                     | Format| Date | Description                    |Source
+--------------------------- | ----- | ---- | -------------------------------|------
+ZAT                         | .shp  | 2012 | 409 ZAT                        | JICA
+Viajes                      | .xlsx | 2012 | 101,396 trips                  | JICA
+Reseau_routier_2010         | .shp  | 2010 | Road network for _dodgr_       | SIRAD Project
+Metro1                      | .shp  | 2015 | Metro line 1                   | ATU
+Metro_estaciones            | .shp  | 2015 | Metro line 1 stops             | personal
+MetropolitanoAlimentadores  | .shp  | 2015 | BRT network                    | ATU
+Bus                         | .shp  | 2015 | Traditional bus lines          | ATU
+Custer                      | .shp  | 2015 | Custer lines                   | ATU
+Combi                       | .shp  | 2015 | Combi lines                    | ATU
+Dir_hogares                 | .shp  | 2012 | 22,704 surveyed households     | JICA 
+Personas                    | .xlsx | 2012 | 86,825 surveyed people         | JICA
+
+
+## Dataset appraisal
+
+```{r Some apraisal on the ZAT database}
+ZAT$area <- st_area(ZAT)
+```
+
+
+```{r dataset apraisal}
+#Computing the trip duration and tackling with the trips starting one day and concluding the following.
+
+viajes$P32_2_01 <- as.numeric(viajes$P32_2_01)
+viajes$P35_2_01 <- as.numeric(viajes$P35_2_01)
+viajes$P32_3_01 <- as.numeric(viajes$P32_3_01)
+viajes$P35_3_01 <- as.numeric(viajes$P35_3_01)
+
+#We need to convert the hours in a 0-23 format. There is an issue with 12 AM and 12 PM which have the same value in the hour column, the difference being the "turno" (AM/PM). 12 AM --> 0 and 12 PM --> 12.
+
+viajes$P35_1_01[viajes$P35_1_01 == 12] <- viajes$P35_1_01[viajes$P35_1_01 == 12] - 12*(2-viajes$P35_3_01[viajes$P35_1_01 == 12])
+viajes$P35_1_01[viajes$P35_1_01 != 12] <- viajes$P35_1_01[viajes$P35_1_01 != 12] + 12*(viajes$P35_3_01[viajes$P35_1_01 != 12]-1)
+viajes$P32_1_01[viajes$P32_1_01 == 12] <- viajes$P32_1_01[viajes$P32_1_01 == 12] - 12*(2-viajes$P32_3_01[viajes$P32_1_01 == 12])
+viajes$P32_1_01[viajes$P32_1_01 != 12] <- viajes$P32_1_01[viajes$P32_1_01 != 12] + 12*(viajes$P32_3_01[viajes$P32_1_01 != 12]-1)
+
+viajes$duracion <- viajes$P35_1_01+viajes$P35_2_01/60 - (viajes$P32_1_01+viajes$P32_2_01/60)
+
+#56 trips do not have time data.
+viajes$duracion[is.na(viajes$duracion)] <- 0
+
+
+#291 trips start a day a end the following (duration appear to be negative)
+viajes$duracion[viajes$duracion<0] <- viajes$duracion[viajes$duracion<0]+24
+
+#There is a gap between the duration values lower than 4 hours and the duration values bigger than 12 hours. The latter are all trips starting at 12 AM and ending in the afternoon (typically 1 PM). Only 248 trips have this issue. We assume there was a mistake between AM and PM. To correct it, we remove 12 hours to the trip duration of these.
+viajes$duracion[viajes$duracion>12] <- viajes$duracion[viajes$duracion>12]-12
+
+#Selecting the trips with strictly positive duration (101,396 -> 101,195): 
+viajes <- viajes %>%  filter(duracion>0)
+#Removing one outlier (duracion=228)
+viajes <- viajes %>%  filter(duracion<5)
+
+#Excluding the trips whose ZAT is not in the ZAT list, and also the NA (101,195 -> 101,176):
+
+excl <- c("N/A", "3113", "5002", "6001", "6003", "6004", "6005")
+
+viajes$P33_01[is.na(viajes$P33_01)] <- "N/A"
+viajes$P30_01[is.na(viajes$P30_01)] <- "N/A"
+
+viajes <- viajes[which(!viajes$P33_01 %in% excl),]
+viajes <- viajes[which(!viajes$P30_01 %in% excl),] 
+
+#Getting the main mode. This database manages multimodal trip up to 7 modes. We recover the "main mode" according to JICA hierarchy
+viajes$modo_principal_code <- 0
+
+viajes$P37_1_1_01 <- as.numeric(viajes$P37_1_1_01)
+viajes$P37_2_1_01 <- as.numeric(viajes$P37_2_1_01)
+viajes$P37_3_1_01 <- as.numeric(viajes$P37_3_1_01)
+viajes$P37_4_1_01 <- as.numeric(viajes$P37_4_1_01)
+viajes$P37_5_1_01 <- as.numeric(viajes$P37_5_1_01)
+viajes$P37_6_1_01 <- as.numeric(viajes$P37_6_1_01)
+viajes$P37_7_1_01 <- as.numeric(viajes$P37_7_1_01)
+
+viajes$modo_principal_code <- pmax(viajes$P37_1_1_01,
+                                   viajes$P37_2_1_01,
+                                   viajes$P37_3_1_01,
+                                   viajes$P37_4_1_01,
+                                   viajes$P37_5_1_01,
+                                   viajes$P37_6_1_01,
+                                   viajes$P37_7_1_01,
+                                   na.rm = TRUE)
+  
+viajes$modo_principal_code <- as.numeric(viajes$modo_principal_code)
+viajes$modo_principal_code[is.na(viajes$modo_principal_code)] <- -9
+  
+#Getting the expansion factors on the trip table 
+viajes$ID_PERS <- paste0(viajes$HOGAR, "-", viajes$C2)
+viajes <- viajes %>% left_join(People[,c(3,9)], by = "ID_PERS")
+
+#Adjusting according to JICA method
+viajes$ajust <- 1
+viajes$ajust[viajes$modo_principal_code %in% c(1,2,3,15)] <- 1.29
+viajes$ajust[viajes$modo_principal_code %in% c(8,9,10,11)] <- 1.44
+viajes$ajust[viajes$modo_principal_code %in% c(5,6)] <- 1.91
+
+viajes$EFACTOR_AJUST <- viajes$EFACTOR*viajes$ajust
+
+print(sum(viajes$EFACTOR_AJUST))
+print(sum(viajes$EFACTOR))
+```
+
+Using adjusted weights instead of raw ones gives a total number of trips of 16.7 million / day (+39%).
+
+## Comparison between two ways of chosing the main mode
+
+The main mode in Lima is assigned following a hierarchy between modes. Another way of assigning the main mode could be following the duration of each step, for example choosing the mode with longest trip duration.
+
+```{r another way of computing the main mode}
+##Getting the main mode with another method: the trip step with max duration
+viajes2 <- (viajes[,c(19,22,25,28,31,34,37)])
+viajes2$P37_1_2_01 <- as.numeric(viajes2$P37_1_2_01)
+viajes2$P37_2_2_01 <- as.numeric(viajes2$P37_2_2_01)
+viajes2$P37_3_2_01 <- as.numeric(viajes2$P37_3_2_01)
+viajes2$P37_4_2_01 <- as.numeric(viajes2$P37_4_2_01)
+viajes2$P37_5_2_01 <- as.numeric(viajes2$P37_5_2_01)
+viajes2$P37_6_2_01 <- as.numeric(viajes2$P37_6_2_01)
+viajes2$P37_7_2_01 <- as.numeric(viajes2$P37_7_2_01)
+
+viajes2[is.na(viajes2)] <-0
+
+#getting rid of ex aequo
+
+viajes2$P37_2_2_01[viajes2$P37_2_2_01 == viajes2$P37_1_2_01] <- 
+viajes2$P37_2_2_01[viajes2$P37_2_2_01 == viajes2$P37_1_2_01] + 0.1
+
+viajes2$P37_3_2_01[viajes2$P37_3_2_01 == viajes2$P37_2_2_01 | viajes2$P37_3_2_01 == viajes2$P37_1_2_01] <- viajes2$P37_3_2_01[viajes2$P37_3_2_01 == viajes2$P37_2_2_01 | viajes2$P37_3_2_01 == viajes2$P37_1_2_01] + 0.2
+
+viajes2$P37_4_2_01[viajes2$P37_4_2_01 == viajes2$P37_3_2_01 | viajes2$P37_4_2_01 == viajes2$P37_2_2_01 | viajes2$P37_4_2_01 == viajes2$P37_1_2_01] <- viajes2$P37_4_2_01[viajes2$P37_4_2_01 == viajes2$P37_3_2_01 | viajes2$P37_4_2_01 == viajes2$P37_2_2_01 | viajes2$P37_4_2_01 == viajes2$P37_1_2_01] + 0.3
+
+viajes2$P37_5_2_01[viajes2$P37_5_2_01 == viajes2$P37_4_2_01 | viajes2$P37_5_2_01 == viajes2$P37_3_2_01 | viajes2$P37_5_2_01 == viajes2$P37_2_2_01 | viajes2$P37_5_2_01 == viajes2$P37_1_2_01] <- viajes2$P37_5_2_01[viajes2$P37_5_2_01 == viajes2$P37_4_2_01 | viajes2$P37_5_2_01 == viajes2$P37_3_2_01 | viajes2$P37_5_2_01 == viajes2$P37_2_2_01 | viajes2$P37_5_2_01 == viajes2$P37_1_2_01] + 0.4
+
+#2 min
+for(i in 1:nrow(viajes2)){
+  viajes2$columna_etapa_larga[i] <- names(viajes2)[which(viajes2[i,] == pmax(viajes2$P37_1_2_01[i],
+                                                                             viajes2$P37_2_2_01[i],
+                                                                             viajes2$P37_3_2_01[i],
+                                                                             viajes2$P37_4_2_01[i],
+                                                                             viajes2$P37_5_2_01[i],
+                                                                             viajes2$P37_6_2_01[i],
+                                                                             viajes2$P37_7_2_01[i],
+                                                                             na.rm = TRUE), 
+                                                                             arr.ind = TRUE)[,2]]
+}
+
+viajes2$columna_modo_principal <- 0
+
+viajes2$columna_modo_principal[viajes2$columna_etapa_larga == "P37_1_2_01"] <- "P37_1_1_01" 
+viajes2$columna_modo_principal[viajes2$columna_etapa_larga == "P37_2_2_01"] <- "P37_2_1_01" 
+viajes2$columna_modo_principal[viajes2$columna_etapa_larga == "P37_3_2_01"] <- "P37_3_1_01" 
+viajes2$columna_modo_principal[viajes2$columna_etapa_larga == "P37_4_2_01"] <- "P37_4_1_01" 
+viajes2$columna_modo_principal[viajes2$columna_etapa_larga == "P37_5_2_01"] <- "P37_5_1_01" 
+
+viajes2$modo_principal_code_2 <- -9
+  
+viajes2$modo_principal_code_2[viajes2$columna_modo_principal == "P37_1_1_01"] <- viajes$P37_1_1_01[viajes2$columna_modo_principal == "P37_1_1_01"]
+viajes2$modo_principal_code_2[viajes2$columna_modo_principal == "P37_2_1_01"] <- viajes$P37_2_1_01[viajes2$columna_modo_principal == "P37_2_1_01"]
+viajes2$modo_principal_code_2[viajes2$columna_modo_principal == "P37_3_1_01"] <- viajes$P37_3_1_01[viajes2$columna_modo_principal == "P37_3_1_01"]
+viajes2$modo_principal_code_2[viajes2$columna_modo_principal == "P37_4_1_01"] <- viajes$P37_4_1_01[viajes2$columna_modo_principal == "P37_4_1_01"]
+viajes2$modo_principal_code_2[viajes2$columna_modo_principal == "P37_5_1_01"] <- viajes$P37_5_1_01[viajes2$columna_modo_principal == "P37_5_1_01"]
+
+viajes2$modo_principal_code_2 <- as.numeric(viajes2$modo_principal_code_2)
+viajes2$modo_principal_code_2[is.na(viajes2$modo_principal_code_2)] <- -9
+
+viajes2$EFACTOR <- viajes$EFACTOR
+viajes2$modo_principal_code_1 <- viajes$modo_principal_code
+viajes2$EFACTOR_AJUST_1 <- viajes$EFACTOR_AJUST
+viajes2$ajust_2 <- 1
+viajes2$ajust_2[viajes2$modo_principal_code_2 %in% c(1,2,3,15)] <- 1.29
+viajes2$ajust_2[viajes2$modo_principal_code_2 %in% c(8,9,10,11)] <- 1.44
+viajes2$ajust_2[viajes2$modo_principal_code_2 %in% c(5,6)] <- 1.91
+
+viajes2$EFACTOR_AJUST_2 <- viajes2$EFACTOR*viajes2$ajust_2
+
+```
+
+Let's compare both assignment methods:
+
+```{r assignment comparison ES}
+modal1 <- viajes2 %>% group_by(modo_principal_code_1) %>% summarize(Hierarchy = sum(EFACTOR_AJUST_1))
+modal2 <- viajes2 %>% group_by(modo_principal_code_2) %>% summarize(Duration = sum(EFACTOR_AJUST_2))
+modal1 <- modal1 %>% left_join(modal2, by = c("modo_principal_code_1" = "modo_principal_code_2"))
+modal1$modo <- c("Otro", "A pie", "Bicicleta", "Moto", "Mototaxi o bicitaxi", "Auto", "Taxi", "Taxi colectivo", "Combi", "Custer", "Bus",    "BRT", "Otro", "Otro", "Otro", "Metro",  "Otro", "Otro")
+modal1$Hierarchy_percent <- 100*modal1$Hierarchy/sum(modal1$Hierarchy)
+modal1$Duration_percent <- 100*modal1$Duration/sum(modal1$Duration)
+
+data <- data.frame(
+  modo = rep(modal1$modo,2),
+  trips = c(modal1$Hierarchy_percent, modal1$Duration_percent),
+  metodo = c(rep("Jerarquía modal", nrow(modal1)), rep("Etapa de mayor duración",nrow(modal1)))
+)
+
+ggplot(data, aes(fill=metodo, y=reorder(modo, -trips), x=trips)) + 
+  geom_bar(position="dodge", stat="identity") +
+  coord_flip() +
+  theme_bw() +
+  labs(x="Reparto modal (%)", y = "Modo principal", fill = "Metodo") +
+  scale_fill_manual(values = c("darkgoldenrod1", "darkorange2"))+
+  theme(axis.text.x = element_text(angle = 15, vjust = 0.5, hjust=0.3))
+```
+
+```{r assignment comparison EN, eval = FALSE}
+modal1 <- viajes2 %>% group_by(modo_principal_code_1) %>% summarize(Hierarchy = sum(EFACTOR_AJUST_1))
+modal2 <- viajes2 %>% group_by(modo_principal_code_2) %>% summarize(Duration = sum(EFACTOR_AJUST_2))
+modal1 <- modal1 %>% left_join(modal2, by = c("modo_principal_code_1" = "modo_principal_code_2"))
+modal1$modo <- c("Other", "Walking", "Bike", "Motorbike", "Mototaxi", "Private car", "Taxi", "Colectivo", "Combi", "Custer", "Bus", "BRT", "Other", "Other", "Other", "Rapid transit",  "Other", "Other")
+modal1$Hierarchy_percent <- 100*modal1$Hierarchy/sum(modal1$Hierarchy)
+modal1$Duration_percent <- 100*modal1$Duration/sum(modal1$Duration)
+
+data <- data.frame(
+  modo = rep(modal1$modo,2),
+  trips = c(modal1$Hierarchy_percent, modal1$Duration_percent),
+  metodo = c(rep("Mode Hierarchy", nrow(modal1)), rep("Longest duration stage",nrow(modal1)))
+)
+
+ggplot(data, aes(fill=metodo, y=reorder(modo, -trips), x=trips)) + 
+  geom_bar(position="dodge", stat="identity") +
+  coord_flip() +
+  theme_bw() +
+  labs(x="Modal share (%)", y = "Mode", fill = "Main mode \nAssignment Method") +
+  scale_fill_manual(values = c("darkgoldenrod1", "darkorange2"))+
+  theme(axis.text.x = element_text(angle = 15, vjust = 0.5, hjust=0.3))
+
+
+test_modo_principal <- t.test(modal1$Hierarchy_percent, modal1$Duration_percent)
+test_modo_principal
+```
+
+
+We do not notice a significant difference between both methods (0.7%). **The "longest trip duration" method tends to slightly favor Walking while the "hierarchy" method tends to slightly favor the BRT, Bus and custer.**
+
+Therefore, in the rest of the document, we decide to use the "hierarchy" method, following the practice found in the literature. 
+ 
+# Counting active OD pairs in the trips database
+
+Computing the active ZAT pairs.
+
+```{r active ZAT pairs}
+active_ZAT <- viajes[,c(7,12,61)] %>% group_by(P30_01, P33_01) %>% summarise(n = n(),viajes = sum(EFACTOR_AJUST))
+
+mat_active_ZAT <- as.matrix(xtabs(viajes~P30_01+P33_01, data=active_ZAT))
+
+ini <- rep(0, nrow(ZAT)*nrow(ZAT))
+ZATCount <- matrix(ini, nrow = nrow(ZAT), dimnames = list(ZAT$TRAFFICZON, ZAT$TRAFFICZON))
+for(i in 1:nrow(ZAT)){
+  for(j in 1:nrow(ZAT)){
+    ori <- ZAT$TRAFFICZON[i]
+    dest <- ZAT$TRAFFICZON[j]
+    row <- match(ori, rownames(mat_active_ZAT))
+    col <- match(dest, colnames(mat_active_ZAT))
+    ZATCount[i,j] <- mat_active_ZAT[row,col]
+  }
+}
+
+heatmap(ZATCount, Colv = NA, Rowv = NA)
+```
+
+We see their are many zeros: 82%. The boolean matrix confirms:
+
+```{r active ZAT pairs bool}
+ZATBool <- ZATCount
+ZATBool[ZATBool > 0] <- TRUE
+ZATBool[ZATBool == 0] <- FALSE
+
+ZATBool2 <- as.data.frame(as.table(ZATBool))
+colnames(ZATBool2) <- c("P30_01", "P33_01", "viaje")
+
+
+ggplot(ZATBool2, aes(P30_01, P33_01, fill= factor(viaje))) + 
+    geom_tile(lwd = 0,
+              linetype = 1)+
+    scale_fill_manual(values = c('red', 'green'), labels = c("No", "Sí"))+
+    theme(axis.text.x = element_text(angle = 90, size = 4))+
+    theme(axis.text.y = element_text(size = 4))+
+  labs(fill = "¿Viaje?")
+```
+
+Therefore we have no interest in computing full distance matrix. Instead, we should compute distances only on active OD pairs. 
+However, we evidenced that the algorithm we use to compute distances ( _dodgr_) are far quicker on huge matrix than on one-by-one computation, so we will still rely on huge matrix in the rest of this document.   
+
+# Sampling ZAT
+
+To check the effect of the surface area of the zones, we do some sampling on the ZAT: we sample some points on each zone and replace the centroid-to-centroid distance by the distance between the sampled points. Finally we carry out basic statistics to see the global size effect of the zones.
+
+```{r sampling}
+#sample size
+s <- 20
+d <- nrow(ZAT)
+
+ZAT_urban <- ZAT_urban %>% st_transform(4326)
+ZAT <- ZAT %>% st_transform(4326)
+
+#Takes ~ 20 sec for s = 20.
+ZATSampled <- st_sample(ZAT, rep(s,d))
+
+ZATSampled <- st_sf(ZATSampled) %>%
+  st_join(ZAT[,3],
+          join = st_intersects)
+
+ZATSampled$row <- rep(c(1:s),d)
+
+zoom_level <- 9.5
+lon_span <- 360 / 2^zoom_level
+lat_span <- 360 / 2^zoom_level
+
+zoom_to_Lima <- c(-76.94, -12.05)  # Lima
+lon_bounds_Lima <- c(zoom_to_Lima[1] - lon_span / 2, zoom_to_Lima[1] + lon_span / 2)
+lat_bounds_Lima <- c(zoom_to_Lima[2] - lat_span / 2, zoom_to_Lima[2] + lat_span / 2)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, fill = "white")+
+  geom_sf(data = ZATSampled, aes(col = factor(row)))+
+  labs(title = paste0("Las ZAT y un muestreo de ", s,  " puntos en cada una"), col = "Puesto") +
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+ 
+  labs(x = "", y = "") +
+  theme(legend.position = "right",
+        legend.text = element_text(size=10))+
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.8) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.8, "cm"), width = unit(0.8, "cm"))
+```
+
+## Euclidean distance
+
+```{r sampled straight line}
+#computing the complete distance matrix from each sampled UTAM to each sampled UTAM (size (s*d)²).
+mat <- as.data.frame(st_distance(x = ZATSampled$geometry, y = ZATSampled$geometry))
+rownames(mat) <- paste0(ZATSampled$TRAFFICZON, "_",ZATSampled$row)
+colnames(mat) <- paste0(ZATSampled$TRAFFICZON, "_",ZATSampled$row)
+```
+
+Join with the trip database
+
+```{r sampled euclidean chart with foreach, eval = TRUE}
+doFuture::registerDoFuture()
+future::plan(multisession, workers = 12)
+options(future.globals.maxSize= 1048576000)
+viajes2 <- viajes[viajes$P30_01 %in% ZAT_urban$TRAFFICZON & viajes$P33_01 %in% ZAT_urban$TRAFFICZON,c(6,61,7,12)]
+viajes2$id_unico <- 1:nrow(viajes2)
+
+comb <- function(z) {
+  merge(viajes2, z, by = c("P30_01", "P33_01")) %>% 
+    arrange(id_unico) %>%
+    select(c(-P30_01, -P33_01, -ID_VIAJE, -EFACTOR_AJUST, -id_unico))
+}
+
+print(Sys.time())
+
+viajes3 <- foreach(u = 1:s, .combine = 'cbind') %:%
+  foreach(v = 1:s, .combine = 'cbind') %dofuture% {
+    subset_i = seq(from = u, to = s*d, by = s)
+    subset_j = seq(from = v, to = s*d, by = s)
+    z <- mat[subset_i,subset_j]
+    colnames(z) <- ZAT$TRAFFICZON
+    rownames(z) <- ZAT$TRAFFICZON
+    z <- data.frame(rownames(as.matrix(z))[row(as.matrix(z))], 
+               colnames(as.matrix(z))[col(as.matrix(z))], 
+               c(as.matrix(z)))
+    colnames(z) <- c("P30_01", "P33_01", paste0("dist",(u-1)*s+(v-1)))
+    x <- comb(z)
+  }
+
+
+print(Sys.time())
+
+viajes2 <- cbind(viajes2, viajes3)
+
+#Computing the total distance (matrix product)
+dist_table <- as.matrix(viajes2[,6:(5+s^2)])
+dist <- as.data.frame(t(viajes2$EFACTOR_AJUST %*% dist_table /1000))
+
+avg <- mean(dist$V1)
+sd(dist$V1)
+max(dist$V1)
+min(dist$V1)
+
+ggplot(data = dist, aes(x = V1))+
+  theme_bw()+
+  geom_histogram(binwidth = 1e+05, color = "white", fill = "red")+
+  geom_vline(aes(xintercept = avg, color = paste0("mean = ", round(avg/1e06, 1), " million")), linewidth = 1)+
+  scale_color_manual(name = "", values = "blue")+
+  labs(title = paste0("Histogram of distances between ZAT in straight line", "\n" ,"n = ", s), x = "Distance (people.km/day)")
+```
+
+With a 20-sampling, average total PKT following a straight line (Euclidian distance) is 104 million people.km.
+
+## Road network
+
+```{r sampled road network}
+#Opening the road network
+Routes <- st_cast(Routes, "LINESTRING") 
+Routes$OBJECTID = NULL
+
+#Giving weights to the road network and keeping only the biggest connected component to reduce the number of NA.
+net_mot <- weight_streetnet(Routes, wt_profile = "motorcar", type_col = "type")
+net_mot <- net_mot[net_mot$component == 1,]
+
+#Computing the OD distance matrix for the motorized modes. It is very fast! (3 min for s = 20)
+mat_mot <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(ZATSampled)), to = as.data.frame(st_coordinates(ZATSampled)), shortest = TRUE)
+rownames(mat_mot) <- paste0(ZATSampled$TRAFFICZON, "_",ZATSampled$row)
+colnames(mat_mot) <- paste0(ZATSampled$TRAFFICZON, "_",ZATSampled$row)
+
+#Dealing with NA using the straight line distance when necessary (it appears that there are no NA in this case)
+mat_mot[is.na(mat_mot)] <- mat[is.na(mat_mot)]
+```
+
+Join with the trips database
+
+```{r sampled road network chart with foreach, eval = TRUE}
+doFuture::registerDoFuture()
+future::plan(multisession, workers = 12)
+viajes2 <- viajes[viajes$P30_01 %in% ZAT_urban$TRAFFICZON & viajes$P33_01 %in% ZAT_urban$TRAFFICZON,c(6,61,7,12)]
+viajes2$id_unico <- 1:nrow(viajes2)
+
+comb <- function(z) {
+  merge(viajes2, z, by = c("P30_01", "P33_01")) %>% 
+    arrange(id_unico) %>%
+    select(c(-P30_01, -P33_01, -ID_VIAJE, -EFACTOR_AJUST, -id_unico))
+}
+
+print(Sys.time())
+
+viajes3 <- foreach(u = 1:s, .combine = 'cbind') %:%
+  foreach(v = 1:s, .combine = 'cbind') %dofuture% {
+    subset_i = seq(from = u, to = s*d, by = s)
+    subset_j = seq(from = v, to = s*d, by = s)
+    z <- mat_mot[subset_i,subset_j]
+    colnames(z) <- ZAT$TRAFFICZON
+    rownames(z) <- ZAT$TRAFFICZON
+    z <- data.frame(rownames(as.matrix(z))[row(as.matrix(z))], 
+               colnames(as.matrix(z))[col(as.matrix(z))], 
+               c(as.matrix(z)))
+    colnames(z) <- c("P30_01", "P33_01", paste0("dist",(u-1)*s+(v-1)))
+    x <- comb(z)
+  }
+
+
+print(Sys.time())
+
+viajes2 <- cbind(viajes2, viajes3)
+
+#Computing the total distance (matrix product)
+dist_table <- as.matrix(viajes2[,6:(5+s^2)])
+dist <- as.data.frame(t(viajes2$EFACTOR_AJUST %*% dist_table /1000))
+
+avg <- mean(dist$V1)
+sd <- sd(dist$V1)
+max(dist$V1)
+min(dist$V1)
+
+margin = qt(0.975,df=s^2-1)*sd/s
+
+upper_bound = avg + margin
+lower_bound = avg - margin
+
+ggplot(data = dist, aes(x = V1))+
+  theme_bw()+
+  geom_histogram(binwidth = 1e+05, color = "white", fill = "red")+
+  geom_vline(aes(xintercept = avg, color = paste0("mean = ", round(avg/1e06, 1), " million")), linewidth = 1)+
+  scale_color_manual(name = "", values = "blue")+
+  labs(title = paste0("Histogram of distances between ZAT by the road network", "\n" ,"n = ", s), x = "Total PKT")
+```
+
+With a 20-sampling, average total PKT reaches 130.9 million people.km. This is a increase of 26% in the total distance.
+
+
+Discussion: 
+
+* do outliers have to be removed of not?
+* does the centroid-based approach tend to underestimate the distance, or conversely does the sample-based approach tend to overestimate it?
+
+```{r comparing the centroid to centroid distance with the above ZAT}
+ZATCentroids <- st_centroid(ZAT_urban)
+mat_straight <- as.data.frame(st_distance(x = ZATCentroids$geometry, y = ZATCentroids$geometry))
+rownames(mat_straight) <- ZATCentroids$TRAFFICZON
+colnames(mat_straight) <- ZATCentroids$TRAFFICZON
+
+mat_mot_centroids <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_mot_centroids) <- ZATCentroids$TRAFFICZON
+colnames(mat_mot_centroids) <- ZATCentroids$TRAFFICZON
+mat_mot_centroids[is.na(mat_mot_centroids)] <- mat_straight[is.na(mat_mot_centroids)]
+mat_mot_centroids_table <- as.data.frame(as.table(mat_mot_centroids))
+colnames(mat_mot_centroids_table) <- c("P30_01", "P33_01", "distCentroids")
+
+viajes2 <- merge(viajes2, mat_mot_centroids_table, by = c("P30_01", "P33_01")) 
+```
+
+```{r Choosing a method for intrazone trips ZAT}
+viajes_intra <- viajes2[viajes2$P30_01 == viajes2$P33_01,] #20247/99820 observations
+  
+dist_table <- as.matrix(viajes_intra[,6:(6+s^2)])
+dist <- as.data.frame(t(viajes_intra$EFACTOR_AJUST %*% dist_table /1000)) %>% arrange(V1) 
+
+#indexes of the columns where internal distance is equal to zero:
+index_zero <- rep("VIDE",s)
+for(i in 1:s){
+    index_zero[i] <- paste0("dist",(i-1)*s+(i-1))
+}
+
+#First method for intra zone distance: the average distance of the trips in the non-zero cases.
+viajes_intra_non_zero <- viajes_intra[,!(colnames(viajes_intra) %in% index_zero)]
+viajes_intra$dist_mean_non_zeros <- rowMeans(viajes_intra_non_zero[,6:385])
+
+viajes_intra_mean_non_zeros <- viajes_intra
+viajes_intra_mean_non_zeros[,(colnames(viajes_intra) %in% index_zero)] <- viajes_intra_mean_non_zeros$dist_mean_non_zeros
+viajes_intra_mean_non_zeros$distCentroids <- viajes_intra_mean_non_zeros$dist_mean_non_zeros
+
+#Second method: the CEREMA formula
+viajes_intra <- viajes_intra %>% 
+  left_join(ZAT[,c("TRAFFICZON","area")], by = c("P30_01" = "TRAFFICZON")) 
+viajes_intra$geometry = NULL
+viajes_intra$dist_cerema <- 0.5*sqrt(viajes_intra$area)
+
+viajes_intra_cerema <- viajes_intra
+viajes_intra_cerema[,(colnames(viajes_intra) %in% index_zero)] <- viajes_intra_cerema$dist_cerema
+viajes_intra_cerema$distCentroids <- viajes_intra_cerema$dist_cerema
+
+#Comparison: CEREMA gives lower estimates
+plot(viajes_intra$dist_mean_non_zeros, viajes_intra$dist_cerema)
+reg <- lm(dist_mean_non_zeros ~ dist_cerema, data = viajes_intra)
+summary(reg) #Both are highly correlated and the regression is significant. Coeff for dist_cerema is 2.3 (higher than in Bgta)
+
+#rebuilding the trip table with the zeros substituted by the means-non-zeros method
+viajes2_mean_non_zeros <- rbind(viajes2[viajes2$P30_01 != viajes2$P33_01,], viajes_intra_mean_non_zeros[,1:406])
+viajes2_mean_non_zeros$distAverageSample <- rowMeans(viajes2_mean_non_zeros[,6:405])
+
+#rebuilding the trip table with the zeros substituted by the cerema method
+viajes2_cerema <- rbind(viajes2[viajes2$P30_01 != viajes2$P33_01,], viajes_intra_cerema[,1:406])
+viajes2_cerema$distAverageSample <- rowMeans(viajes2_cerema[,6:405])
+
+#Student test
+t_mean_non_zeros_zat <- t.test(viajes2_mean_non_zeros$distAverageSample, viajes2_mean_non_zeros$distCentroids)
+t_cerema_zat <- t.test(viajes2_cerema$distAverageSample, viajes2_cerema$distCentroids)
+
+t_mean_non_zeros_zat
+t_cerema_zat
+
+#in both cases the mean is statistically different but the p-value is higher for the mean_non_zero method --> Centroids are not a so good approx.
+
+#Computing the total distance (matrix product) for Method 1
+dist <- as.data.frame(t(viajes2_mean_non_zeros$EFACTOR_AJUST %*% as.matrix(viajes2_mean_non_zeros[,6:(7+s^2)]) /1000))
+dist$sample <- rownames(dist)
+
+dist$highlight <- ifelse(dist$sample == "distCentroids", "yes", "no")
+
+avg <- mean(dist$V1)
+
+ggplot(data = dist, aes(x = V1))+
+  theme_bw()+
+  geom_histogram(binwidth = 1e+05, color = "white", aes(fill = highlight))+
+  geom_vline(aes(xintercept = avg, color = paste0("mean = ", round(avg/1e06, 1), " million")), linewidth = 1)+
+  scale_fill_manual(values = c("red", "green"), labels = c("sampled points", "centroids"))+
+  scale_color_manual(name = "", values = "blue")+
+  labs(title = paste0("Avg Intrazone dist as the average of non-zero intrazone dists", "\n" ,"n = ", s), x = "Total PKT", fill = "")
+
+#Computing the total distance (matrix product) for Method 2
+dist <- as.data.frame(t(viajes2_cerema$EFACTOR_AJUST %*% as.matrix(viajes2_cerema[,6:(7+s^2)]) /1000))
+dist$sample <- rownames(dist)
+
+dist$highlight <- ifelse(dist$sample == "distCentroids", "yes", "no")
+
+avg <- mean(dist$V1)
+
+ggplot(data = dist, aes(x = V1))+
+  theme_bw()+
+  geom_histogram(binwidth = 1e+05, color = "white", aes(fill = highlight))+
+  geom_vline(aes(xintercept = avg, color = paste0("mean = ", round(avg/1e06, 1), " million")), linewidth = 1)+
+  scale_fill_manual(values = c("red", "green"), labels = c("sampled points", "centroids"))+
+  scale_color_manual(name = "", values = "blue")+
+  labs(title = paste0("Avg Intrazone dist using the Cerema formula", "\n" ,"n = ", s), x = "Total PKT", fill = "")
+
+```
+
+```{r saving for ZAT}
+viajes2_export <- viajes2_cerema
+viajes2_export$distCentroids_correct_mean_non_zeros <- viajes2_mean_non_zeros$distCentroids
+viajes2_export$distCentroids_correct_cerema <- viajes2_cerema$distCentroids
+viajes2_export$distAverage_correct_mean_non_zeros <- viajes2_mean_non_zeros$distAverageSample
+viajes2_export$distAverage_correct_cerema <- viajes2_cerema$distAverageSample
+viajes2_export$distCentroids = NULL
+viajes2_export$distAverageSample = NULL
+
+write.csv(viajes2_export, file = paste0("Viajes_dist_ZAT_", s, ".csv"))
+```
+
+# Distance computation on the trip database
+
+## Network apraisal
+
+We use _dodgr_ for the road network (dual-weighted) and _sfnetworks_ for public transport networks (single-weighted).
+
+### Road network
+
+_dodgr_ remains the best option for quick many-to-many routing on dual-weighted networks, even for big matrix: 30 seconds approx. to compute matrix with 20 million cases!
+```{r ROUTES VIA DODGR}
+#Opening the road network (not necessary if already done before)
+#Routes <- st_cast(Routes, "LINESTRING")
+#Routes <- Routes %>% st_transform(4326)
+
+#Giving weights to the road network and keeping the biggest connected component (already done before for the motorized weighting). 
+#net_mot <- weight_streetnet(Routes, wt_profile = "motorcar", type_col = "type")
+#net_mot <- net_mot[net_mot$component == 1,]
+net_cycl <- weight_streetnet(Routes, wt_profile = "bicycle", type_col = "type")
+net_cycl <- net_cycl[net_cycl$component == 1,]
+net_walk <- weight_streetnet(Routes, wt_profile = "foot", type_col = "type")
+net_walk <- net_walk[net_walk$component == 1,]
+```
+
+### Metro line 1
+
+```{r Metro}
+#Building the network
+net_metro = as_sfnetwork(Metro, directed = FALSE) %>%
+  st_transform(4326) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length())
+
+#Including (blend) the stations to the network
+net_metro = st_network_blend(net_metro, Metro_stops)
+
+#Computing the new length of each edge 
+net_metro <- net_metro %>% activate("edges") %>% mutate(weight = edge_length())
+```
+
+### BRT
+
+```{r BRT}
+BRT <- st_cast(BRT, "LINESTRING")
+BRT_stops <- st_cast(BRT_stops, "POINT")
+
+#Building the network
+net_brt = as_sfnetwork(BRT, directed = FALSE) %>%
+  st_transform(4326) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length())
+
+#Subdividing edges
+net_brt = convert(net_brt, to_spatial_subdivision)
+
+#Including (blend) the stations to the network
+net_brt = st_network_blend(net_brt, BRT_stops)
+
+net_brt <- net_brt %>%
+  activate("nodes") %>%
+  filter(group_components() == 1)
+
+#Computing the new length of each edge 
+net_brt <- net_brt %>% activate("edges") %>% mutate(weight = edge_length())
+```
+
+### Bus
+
+```{r Bus}
+Bus <- st_cast(Bus, "LINESTRING")
+
+#Building the network
+net_bus = as_sfnetwork(Bus, directed = FALSE) %>%
+  st_transform(4326) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length())
+
+#Subdividing edges
+net_bus = convert(net_bus, to_spatial_subdivision)
+
+#Computing the new length of each edge 
+net_bus <- net_bus %>% activate("edges") %>% mutate(weight = edge_length())
+```
+
+### Custer
+
+```{r Custer}
+Custer <- st_cast(Custer, "LINESTRING")
+
+#Building the network
+net_custer = as_sfnetwork(Custer, directed = FALSE) %>%
+  st_transform(4326) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length())
+
+#Subdividing edges
+net_custer = convert(net_custer, to_spatial_subdivision)
+
+#Computing the new length of each edge
+net_custer <- net_custer %>% activate("edges") %>% mutate(weight = edge_length())
+```
+
+### Combi
+
+```{r Combi}
+Combi <- st_cast(Combi, "LINESTRING")
+
+#Building the network
+net_combi = as_sfnetwork(Combi, directed = FALSE) %>%
+  st_transform(4326) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length()) %>%
+  activate("nodes") 
+
+#Subdividing edges
+net_combi = convert(net_combi, to_spatial_subdivision)
+
+net_combi <- net_combi %>%
+  activate("nodes") %>%
+  filter(group_components() == 1)
+
+#Computing the new length of each edge
+net_combi <- net_combi %>% activate("edges") %>% mutate(weight = edge_length())
+```
+
+## Distance computation
+
+We will compute the distance of each trip using 8 main modes as follows: 
+
+
+mode       |  R package 
+-----------|------------
+Motorized  | _dodgr_
+Cycling    | _dodgr_
+Walking    | _dodgr_
+Metro      | _sfnetworks_
+BRT        | _sfnetworks_
+Bus        | _sfnetworks_
+Custer     | _sfnetworks_
+Combi      | _sfnetworks_
+
+
+To make it quicker, instead of an "if" loop, we subset the trip table into 4 tables according to the values of "P31_01" (start point) and "P34_01" (end point):
+
+
+* trips from home to home (1->1).
+* trips from home to another place (1->other).
+* trips from another place to home (other->1).
+* trips that do not include home (other->other).
+
+```{r Computing distance matrix using ZAT centroids and households adresses}
+ZATCentroids <- st_centroid(ZAT)
+
+#Creating matrix with distances in straight lines. They will also be used to substitute NA values in the following  matrix (40 secs)
+mat_straight_12 <- as.data.frame(st_distance(x = st_geometry(Direccion), y = st_geometry(ZATCentroids)))
+rownames(mat_straight_12) <- Direccion$HOGAR
+colnames(mat_straight_12) <- ZAT$TRAFFICZON
+mat_straight_12_table <- as.data.frame(as.table(as.matrix(mat_straight_12)))
+colnames(mat_straight_12_table) <- c("HOGAR", "P33_01", "dist_straight")
+#mat_straight_12_table$unique_id <- paste0(mat_straight_12_table$HOGAR, "_", mat_straight_12_table$P33_01)
+
+#80 secs
+mat_straight_21 <- as.data.frame(st_distance(x = st_geometry(ZATCentroids), y = st_geometry(Direccion)))
+rownames(mat_straight_21) <- ZAT$TRAFFICZON
+colnames(mat_straight_21) <- Direccion$HOGAR
+mat_straight_21_table <- as.data.frame(as.table(as.matrix(mat_straight_21)))
+colnames(mat_straight_21_table) <- c("P30_01", "HOGAR", "dist_straight")
+#mat_straight_21_table$unique_id <- paste0(mat_straight_21_table$P30_01, "_", mat_straight_21_table$HOGAR)
+
+#1 sec
+mat_straight_22 <- as.data.frame(st_distance(x = st_geometry(ZATCentroids), y = st_geometry(ZATCentroids)))
+rownames(mat_straight_22) <- ZAT$TRAFFICZON
+colnames(mat_straight_22) <- ZAT$TRAFFICZON
+mat_straight_22_table <- as.data.frame(as.table(as.matrix(mat_straight_22)))
+colnames(mat_straight_22_table) <- c("P30_01", "P33_01", "dist_straight")
+#mat_straight_22_table$unique_id <- paste0(mat_straight_22_table$P30_01, "_", mat_straight_22_table$P33_01)
+
+#MOTORIZADO
+# 1 --> 2 (Hogar --> ZAT) (15 secs)
+#Some Direccions are snapped to the same node in the road network, so for a given ZAT we get only 12938 distinct distances instead of nrow(Direccion) = 22704.
+mat_mot_12 <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(Direccion)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_mot_12) <- Direccion$HOGAR
+colnames(mat_mot_12) <- ZAT$TRAFFICZON
+mat_mot_12[is.na(mat_mot_12)] <- mat_straight_12[is.na(mat_mot_12)]
+mat_mot_12_table <- as.data.frame(as.table(mat_mot_12))
+colnames(mat_mot_12_table) <- c("HOGAR", "P33_01", "dist_car")
+#mat_mot_12_table$unique_id <- paste0(mat_mot_12_table$HOGAR, "_", mat_mot_12_table$P33_01)
+
+# 2 --> 1 (ZAT --> Hogar) (15 secs)
+mat_mot_21 <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(Direccion)), shortest = TRUE)
+rownames(mat_mot_21) <- ZAT$TRAFFICZON
+colnames(mat_mot_21) <- Direccion$HOGAR
+mat_mot_21[is.na(mat_mot_21)] <- mat_straight_21[is.na(mat_mot_21)]
+mat_mot_21_table <- as.data.frame(as.table(mat_mot_21))
+colnames(mat_mot_21_table) <- c("P30_01", "HOGAR", "dist_car")
+#mat_mot_21_table$unique_id <- paste0(mat_mot_21_table$P30_01, "_", mat_mot_21_table$HOGAR)
+
+# 2 --> 2 (ZAT --> ZAT) (10 secs)
+mat_mot_22 <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_mot_22) <- ZAT$TRAFFICZON
+colnames(mat_mot_22) <- ZAT$TRAFFICZON
+mat_mot_22[is.na(mat_mot_22)] <- mat_straight_22[is.na(mat_mot_22)]
+mat_mot_22_table <- as.data.frame(as.table(mat_mot_22))
+colnames(mat_mot_22_table) <- c("P30_01", "P33_01", "dist_car")
+#mat_mot_22_table$unique_id <- paste0(mat_mot_22_table$P30_01, "_", mat_mot_22_table$P33_01)
+
+#BICI
+# 1 --> 2 (Hogar --> ZAT) (15 secs)
+mat_cycl_12 <- dodgr_dists(graph = net_cycl, from = as.data.frame(st_coordinates(Direccion)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_cycl_12) <- Direccion$HOGAR
+colnames(mat_cycl_12) <- ZAT$TRAFFICZON
+mat_cycl_12[is.na(mat_cycl_12)] <- mat_straight_12[is.na(mat_cycl_12)]
+mat_cycl_12_table <- as.data.frame(as.table(mat_cycl_12))
+colnames(mat_cycl_12_table) <- c("HOGAR", "P33_01", "dist_bike")
+#mat_cycl_12_table$unique_id <- paste0(mat_cycl_12_table$HOGAR, "_", mat_cycl_12_table$P33_01)
+
+# 2 --> 1 (ZAT --> Hogar) (15 secs)
+mat_cycl_21 <- dodgr_dists(graph = net_cycl, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(Direccion)), shortest = TRUE)
+rownames(mat_cycl_21) <- ZAT$TRAFFICZON
+colnames(mat_cycl_21) <- Direccion$HOGAR
+mat_cycl_21[is.na(mat_cycl_21)] <- mat_straight_21[is.na(mat_cycl_21)]
+mat_cycl_21_table <- as.data.frame(as.table(mat_cycl_21))
+colnames(mat_cycl_21_table) <- c("P30_01", "HOGAR", "dist_bike")
+#mat_cycl_21_table$unique_id <- paste0(mat_cycl_21_table$P30_01, "_", mat_cycl_21_table$HOGAR)
+
+# 2 --> 2 (ZAT --> ZAT) (10 secs)
+mat_cycl_22 <- dodgr_dists(graph = net_cycl, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_cycl_22) <- ZAT$TRAFFICZON
+colnames(mat_cycl_22) <- ZAT$TRAFFICZON
+mat_cycl_22[is.na(mat_cycl_22)] <- mat_straight_22[is.na(mat_cycl_22)]
+mat_cycl_22_table <- as.data.frame(as.table(mat_cycl_22))
+colnames(mat_cycl_22_table) <- c("P30_01", "P33_01", "dist_bike")
+#mat_cycl_22_table$unique_id <- paste0(mat_cycl_22_table$P30_01, "_", mat_cycl_22_table$P33_01)
+
+#WALK
+# 1 --> 2 (Hogar --> ZAT) (15 secs)
+mat_walk_12 <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(Direccion)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_walk_12) <- Direccion$HOGAR
+colnames(mat_walk_12) <- ZAT$TRAFFICZON
+mat_walk_12[is.na(mat_walk_12)] <- mat_straight_12[is.na(mat_walk_12)]
+mat_walk_12_table <- as.data.frame(as.table(mat_walk_12))
+colnames(mat_walk_12_table) <- c("HOGAR", "P33_01", "dist_walk")
+#mat_walk_12_table$unique_id <- paste0(mat_walk_12_table$HOGAR, "_", mat_walk_12_table$P33_01)
+
+# 2 --> 1 (ZAT --> Hogar) (15 secs)
+mat_walk_21 <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(Direccion)), shortest = TRUE)
+rownames(mat_walk_21) <- ZAT$TRAFFICZON
+colnames(mat_walk_21) <- Direccion$HOGAR
+mat_walk_21[is.na(mat_walk_21)] <- mat_straight_21[is.na(mat_walk_21)]
+mat_walk_21_table <- as.data.frame(as.table(mat_walk_21))
+colnames(mat_walk_21_table) <- c("P30_01", "HOGAR", "dist_walk")
+#mat_walk_21_table$unique_id <- paste0(mat_walk_21_table$P30_01, "_", mat_walk_21_table$HOGAR)
+
+# 2 --> 2 (ZAT --> ZAT) (10 secs)
+mat_walk_22 <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_walk_22) <- ZAT$TRAFFICZON
+colnames(mat_walk_22) <- ZAT$TRAFFICZON
+mat_walk_22[is.na(mat_walk_22)] <- mat_straight_22[is.na(mat_walk_22)]
+mat_walk_22_table <- as.data.frame(as.table(mat_walk_22))
+colnames(mat_walk_22_table) <- c("P30_01", "P33_01", "dist_walk")
+#mat_cycl_22_table$unique_id <- paste0(mat_cycl_22_table$P30_01, "_", mat_cycl_22_table$P33_01)
+
+#METRO
+# 1 --> 2 (Hogar --> ZAT) (1 sec)
+mat_metro_12 <- st_network_cost(net_metro, from = st_geometry(Direccion), to = st_geometry(ZATCentroids))
+rownames(mat_metro_12) <- Direccion$HOGAR
+colnames(mat_metro_12) <- ZAT$TRAFFICZON
+mat_metro_12_table <- as.data.frame(as.table(mat_metro_12))
+colnames(mat_metro_12_table) <- c("HOGAR", "P33_01", "dist_metro")
+#mat_metro_12_table$unique_id <- paste0(mat_metro_12_table$HOGAR, "_", mat_metro_12_table$P33_01)
+
+# 2 --> 1 (ZAT --> Hogar) (1 sec)
+mat_metro_21 <- st_network_cost(net_metro, from = st_geometry(ZATCentroids), to = st_geometry(Direccion))
+rownames(mat_metro_21) <- ZAT$TRAFFICZON
+colnames(mat_metro_21) <- Direccion$HOGAR
+mat_metro_21_table <- as.data.frame(as.table(mat_metro_21))
+colnames(mat_metro_21_table) <- c("P30_01", "HOGAR", "dist_metro")
+#mat_metro_21_table$unique_id <- paste0(mat_metro_21_table$P30_01, "_", mat_metro_21_table$HOGAR)
+
+# 2 --> 2 (ZAT --> ZAT) (1 sec)
+mat_metro_22 <- st_network_cost(net_metro, from = st_geometry(ZATCentroids), to = st_geometry(ZATCentroids))
+rownames(mat_metro_22) <- ZAT$TRAFFICZON
+colnames(mat_metro_22) <- ZAT$TRAFFICZON
+mat_metro_22_table <- as.data.frame(as.table(mat_metro_22))
+colnames(mat_metro_22_table) <- c("P30_01", "P33_01", "dist_metro")
+#mat_metro_22_table$unique_id <- paste0(mat_metro_22_table$P30_01, "_", mat_metro_22_table$P33_01)
+
+#BRT
+# 1 --> 2 (Hogar --> ZAT) (2 sec)
+mat_brt_12 <- st_network_cost(net_brt, from = st_geometry(Direccion), to = st_geometry(ZATCentroids))
+rownames(mat_brt_12) <- Direccion$HOGAR
+colnames(mat_brt_12) <- ZAT$TRAFFICZON
+mat_brt_12_table <- as.data.frame(as.table(mat_brt_12))
+colnames(mat_brt_12_table) <- c("HOGAR", "P33_01", "dist_brt")
+#mat_brt_12_table$unique_id <- paste0(mat_brt_12_table$HOGAR, "_", mat_brt_12_table$P33_01)
+
+# 2 --> 1 (ZAT --> Hogar) (1 sec)
+mat_brt_21 <- st_network_cost(net_brt, from = st_geometry(ZATCentroids), to = st_geometry(Direccion))
+rownames(mat_brt_21) <- ZAT$TRAFFICZON
+colnames(mat_brt_21) <- Direccion$HOGAR
+mat_brt_21_table <- as.data.frame(as.table(mat_brt_21))
+colnames(mat_brt_21_table) <- c("P30_01", "HOGAR", "dist_brt")
+#mat_brt_21_table$unique_id <- paste0(mat_brt_21_table$P30_01, "_", mat_brt_21_table$HOGAR)
+
+# 2 --> 2 (ZAT --> ZAT) (1 sec)
+mat_brt_22 <- st_network_cost(net_brt, from = st_geometry(ZATCentroids), to = st_geometry(ZATCentroids))
+rownames(mat_brt_22) <- ZAT$TRAFFICZON
+colnames(mat_brt_22) <- ZAT$TRAFFICZON
+mat_brt_22_table <- as.data.frame(as.table(mat_brt_22))
+colnames(mat_brt_22_table) <- c("P30_01", "P33_01", "dist_brt")
+#mat_brt_22_table$unique_id <- paste0(mat_brt_22_table$P30_01, "_", mat_brt_22_table$P33_01)
+
+#BUS
+# 1 --> 2 (Hogar --> ZAT) (40 sec)
+mat_bus_12 <- st_network_cost(net_bus, from = st_geometry(Direccion), to = st_geometry(ZATCentroids))
+rownames(mat_bus_12) <- Direccion$HOGAR
+colnames(mat_bus_12) <- ZAT$TRAFFICZON
+mat_bus_12_table <- as.data.frame(as.table(mat_bus_12))
+colnames(mat_bus_12_table) <- c("HOGAR", "P33_01", "dist_bus")
+#mat_bus_12_table$unique_id <- paste0(mat_bus_12_table$HOGAR, "_", mat_bus_12_table$P33_01)
+
+# 2 --> 1 (ZAT --> Hogar) (2 sec)
+mat_bus_21 <- st_network_cost(net_bus, from = st_geometry(ZATCentroids), to = st_geometry(Direccion))
+rownames(mat_bus_21) <- ZAT$TRAFFICZON
+colnames(mat_bus_21) <- Direccion$HOGAR
+mat_bus_21_table <- as.data.frame(as.table(mat_bus_21))
+colnames(mat_bus_21_table) <- c("P30_01", "HOGAR", "dist_bus")
+#mat_bus_21_table$unique_id <- paste0(mat_bus_21_table$P30_01, "_", mat_bus_21_table$HOGAR)
+
+# 2 --> 2 (ZAT --> ZAT) (2 sec)
+mat_bus_22 <- st_network_cost(net_bus, from = st_geometry(ZATCentroids), to = st_geometry(ZATCentroids))
+rownames(mat_bus_22) <- ZAT$TRAFFICZON
+colnames(mat_bus_22) <- ZAT$TRAFFICZON
+mat_bus_22_table <- as.data.frame(as.table(mat_bus_22))
+colnames(mat_bus_22_table) <- c("P30_01", "P33_01", "dist_bus")
+#mat_bus_22_table$unique_id <- paste0(mat_bus_22_table$P30_01, "_", mat_bus_22_table$P33_01)
+
+#CUSTER
+# 1 --> 2 (Hogar --> ZAT) (75 sec)
+mat_custer_12 <- st_network_cost(net_custer, from = st_geometry(Direccion), to = st_geometry(ZATCentroids))
+rownames(mat_custer_12) <- Direccion$HOGAR
+colnames(mat_custer_12) <- ZAT$TRAFFICZON
+mat_custer_12_table <- as.data.frame(as.table(mat_custer_12))
+colnames(mat_custer_12_table) <- c("HOGAR", "P33_01", "dist_custer")
+#mat_custer_12_table$unique_id <- paste0(mat_custer_12_table$HOGAR, "_", mat_custer_12_table$P33_01)
+
+# 2 --> 1 (ZAT --> Hogar) (2 sec)
+mat_custer_21 <- st_network_cost(net_custer, from = st_geometry(ZATCentroids), to = st_geometry(Direccion))
+rownames(mat_custer_21) <- ZAT$TRAFFICZON
+colnames(mat_custer_21) <- Direccion$HOGAR
+mat_custer_21_table <- as.data.frame(as.table(mat_custer_21))
+colnames(mat_custer_21_table) <- c("P30_01", "HOGAR", "dist_custer")
+#mat_custer_21_table$unique_id <- paste0(mat_custer_21_table$P30_01, "_", mat_custer_21_table$HOGAR)
+
+# 2 --> 2 (ZAT --> ZAT) (2 sec)
+mat_custer_22 <- st_network_cost(net_custer, from = st_geometry(ZATCentroids), to = st_geometry(ZATCentroids))
+rownames(mat_custer_22) <- ZAT$TRAFFICZON
+colnames(mat_custer_22) <- ZAT$TRAFFICZON
+mat_custer_22_table <- as.data.frame(as.table(mat_custer_22))
+colnames(mat_custer_22_table) <- c("P30_01", "P33_01", "dist_custer")
+#mat_custer_22_table$unique_id <- paste0(mat_custer_22_table$P30_01, "_", mat_custer_22_table$P33_01)
+
+#COMBI
+# 1 --> 2 (Hogar --> ZAT) (40 sec)
+mat_combi_12 <- st_network_cost(net_combi, from = st_geometry(Direccion), to = st_geometry(ZATCentroids))
+rownames(mat_combi_12) <- Direccion$HOGAR
+colnames(mat_combi_12) <- ZAT$TRAFFICZON
+mat_combi_12_table <- as.data.frame(as.table(mat_combi_12))
+colnames(mat_combi_12_table) <- c("HOGAR", "P33_01", "dist_combi")
+#mat_combi_12_table$unique_id <- paste0(mat_combi_12_table$HOGAR, "_", mat_combi_12_table$P33_01)
+
+# 2 --> 1 (ZAT --> Hogar) (2 sec)
+mat_combi_21 <- st_network_cost(net_combi, from = st_geometry(ZATCentroids), to = st_geometry(Direccion))
+rownames(mat_combi_21) <- ZAT$TRAFFICZON
+colnames(mat_combi_21) <- Direccion$HOGAR
+mat_combi_21_table <- as.data.frame(as.table(mat_combi_21))
+colnames(mat_combi_21_table) <- c("P30_01", "HOGAR", "dist_combi")
+#mat_combi_21_table$unique_id <- paste0(mat_combi_21_table$P30_01, "_", mat_combi_21_table$HOGAR)
+
+# 2 --> 2 (ZAT --> ZAT) (2 sec)
+mat_combi_22 <- st_network_cost(net_combi, from = st_geometry(ZATCentroids), to = st_geometry(ZATCentroids))
+rownames(mat_combi_22) <- ZAT$TRAFFICZON
+colnames(mat_combi_22) <- ZAT$TRAFFICZON
+mat_combi_22_table <- as.data.frame(as.table(mat_combi_22))
+colnames(mat_combi_22_table) <- c("P30_01", "P33_01", "dist_combi")
+#mat_combi_22_table$unique_id <- paste0(mat_combi_22_table$P30_01, "_", mat_combi_22_table$P33_01)
+```
+
+Now we can fill the trip database.
+
+```{r Filling the trip database}
+viajes_dist <- viajes[,c(1,58,6,7,8,12,13,17,56,57,59,61)]
+
+#Dividing the trip table into 4 sub-tables according to P31_01 and P34_01
+
+viajes_dist_11 <- viajes_dist %>% filter(P31_01 == 1 & P34_01 == 1)
+viajes_dist_12 <- viajes_dist %>% filter(P31_01 == 1 & P34_01 != 1)
+viajes_dist_21 <- viajes_dist %>% filter(P31_01 != 1 & P34_01 == 1)
+viajes_dist_22 <- viajes_dist %>% filter(P31_01 != 1 & P34_01 != 1)
+
+#The Hogar -> Hogar table has all its distances equal to zero
+viajes_dist_11$dist_car <- 0
+viajes_dist_11$dist_bike <- 0
+viajes_dist_11$dist_walk <- 0
+viajes_dist_11$dist_metro <- 0
+viajes_dist_11$dist_brt <- 0
+viajes_dist_11$dist_bus <- 0
+viajes_dist_11$dist_custer <- 0
+viajes_dist_11$dist_combi <- 0
+viajes_dist_11$dist_straight <- 0
+
+#For the other trip tables, computing matrix distances was already done with dodgr and sfnetworks. We just have to do a multiple-column join. Note that the merge step removes ZAT that are not in the official ZAT tables. 2296 rows are removed. It takes 10 sec for 12 and 21 tables, 1 sec for 22 tables which have fewer rows and zone index.
+
+viajes_dist_12 <- merge(viajes_dist_12, mat_mot_12_table, by = c("HOGAR", "P33_01")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_mot_21_table, by = c("HOGAR", "P30_01")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_mot_22_table, by = c("P30_01", "P33_01")) 
+
+viajes_dist_12 <- merge(viajes_dist_12, mat_cycl_12_table, by = c("HOGAR", "P33_01")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_cycl_21_table, by = c("HOGAR", "P30_01")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_cycl_22_table, by = c("P30_01", "P33_01")) 
+
+viajes_dist_12 <- merge(viajes_dist_12, mat_walk_12_table, by = c("HOGAR", "P33_01")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_walk_21_table, by = c("HOGAR", "P30_01")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_walk_22_table, by = c("P30_01", "P33_01")) 
+
+viajes_dist_12 <- merge(viajes_dist_12, mat_metro_12_table, by = c("HOGAR", "P33_01")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_metro_21_table, by = c("HOGAR", "P30_01")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_metro_22_table, by = c("P30_01", "P33_01")) 
+
+viajes_dist_12 <- merge(viajes_dist_12, mat_brt_12_table, by = c("HOGAR", "P33_01")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_brt_21_table, by = c("HOGAR", "P30_01")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_brt_22_table, by = c("P30_01", "P33_01")) 
+
+viajes_dist_12 <- merge(viajes_dist_12, mat_bus_12_table, by = c("HOGAR", "P33_01")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_bus_21_table, by = c("HOGAR", "P30_01")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_bus_22_table, by = c("P30_01", "P33_01")) 
+
+viajes_dist_12 <- merge(viajes_dist_12, mat_custer_12_table, by = c("HOGAR", "P33_01")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_custer_21_table, by = c("HOGAR", "P30_01")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_custer_22_table, by = c("P30_01", "P33_01")) 
+
+viajes_dist_12 <- merge(viajes_dist_12, mat_combi_12_table, by = c("HOGAR", "P33_01")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_combi_21_table, by = c("HOGAR", "P30_01")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_combi_22_table, by = c("P30_01", "P33_01")) 
+
+
+#The same for the straight line (st_distances)
+viajes_dist_12 <- merge(viajes_dist_12, mat_straight_12_table, by = c("HOGAR", "P33_01")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_straight_21_table, by = c("HOGAR", "P30_01")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_straight_22_table, by = c("P30_01", "P33_01")) 
+```
+
+It may be necessary to reorder columns after the merge process:
+
+```{r Reorder columns}
+#Adapt to the proper number of columns
+viajes_dist_12 <- viajes_dist_12[,c(1,3:6,2,7:21)]
+viajes_dist_21 <- viajes_dist_21[,c(1,3:4,2,5:21)]
+viajes_dist_22 <- viajes_dist_22[,c(3:5,1,6,2,7:21)]
+```
+
+Then we can create the final base with distances
+```{r Final distance base}
+viajes_dist <- rbind(viajes_dist_11, viajes_dist_12, viajes_dist_21, viajes_dist_22)
+
+viajes_dist$dist_real <- viajes_dist$dist_car
+
+viajes_dist$dist_real[viajes_dist$modo_principal_code == 1] <- viajes_dist$dist_walk[viajes_dist$modo_principal_code == 1]
+
+viajes_dist$dist_real[viajes_dist$modo_principal_code == 2] <- viajes_dist$dist_bike[viajes_dist$modo_principal_code == 2]
+
+viajes_dist$dist_real[viajes_dist$modo_principal_code == 15] <- viajes_dist$dist_metro[viajes_dist$modo_principal_code == 15]
+
+viajes_dist$dist_real[viajes_dist$modo_principal_code == 11] <- viajes_dist$dist_brt[viajes_dist$modo_principal_code == 11]
+
+viajes_dist$dist_real[viajes_dist$modo_principal_code == 10] <- viajes_dist$dist_bus[viajes_dist$modo_principal_code == 10]
+
+viajes_dist$dist_real[viajes_dist$modo_principal_code == 9] <- viajes_dist$dist_custer[viajes_dist$modo_principal_code == 9]
+
+viajes_dist$dist_real[viajes_dist$modo_principal_code == 8] <- viajes_dist$dist_combi[viajes_dist$modo_principal_code == 8]
+```
+
+We deal with intrazone length zero trips (that do not involve home) assigning it as the average of intrazone distances calculated from the sample and excluding zeros. The CEREMA method, which was explored, is not used.
+
+```{r intrazone length zero trips with the CEREMA method, eval = FALSE}
+viajes_dist <- viajes_dist %>% left_join(ZAT[,c("TRAFFICZON","area")], by = c("P30_01" = "TRAFFICZON"))
+viajes_dist$geometry = NULL
+viajes_dist$dist_real[viajes_dist$P30_01 == viajes_dist$P33_01 & viajes_dist$dist_real == 0] <- 0.5*sqrt(viajes_dist$area[viajes_dist$P30_01 == viajes_dist$P33_01 & viajes_dist$dist_real == 0])
+```
+
+```{r intrazone length zero trips with the mean of non zero distances method}
+viajes_dist <- viajes_dist %>% left_join(viajes2_export[,c("ID_VIAJE", "distAverage_correct_mean_non_zeros")], by = "ID_VIAJE")
+viajes_dist$dist_real[viajes_dist$P30_01 == viajes_dist$P33_01 & viajes_dist$dist_real == 0] <- 
+viajes_dist$distAverage_correct_mean_non_zeros[viajes_dist$P30_01 == viajes_dist$P33_01 & viajes_dist$dist_real == 0]
+```
+
+Finally, we control travel speed according to the mode, looking for "too fast" trips. Too fast trips are assigned a distance corresponding to max speed: 10 km/h for walking, 30 km/h for cycling, 80 km/h for motorized modes.
+
+```{r speed control}
+#speed is calculated in km/h
+viajes_dist$velocidad <- viajes_dist$dist_real/(1000*viajes_dist$duracion)
+
+viajes_dist$dist_real[viajes_dist$modo_principal_code == 1 & viajes_dist$velocidad > 10] <- 1000*viajes_dist$duracion[viajes_dist$modo_principal_code == 1 & viajes_dist$velocidad > 10]*10
+
+viajes_dist$dist_real[viajes_dist$modo_principal_code == 2 & viajes_dist$velocidad > 30] <- 1000*viajes_dist$duracion[viajes_dist$modo_principal_code == 2 & viajes_dist$velocidad > 30]*30
+
+viajes_dist$dist_real[!(viajes_dist$modo_principal_code %in% c(1,2)) & viajes_dist$velocidad > 80] <- 1000*viajes_dist$duracion[!(viajes_dist$modo_principal_code %in% c(1,2)) & viajes_dist$velocidad > 80]*80
+```
+
+```{r Exporting the trip table}
+write.xlsx(viajes_dist, "Viajes_dist.xlsx")
+```
+
+
+We find a **total distance of 130,891,715 people-km** to be compared with **101,251,652 people-km in a straight line (+29%)**. 
+
+Alternatively, these would be the distances (in km) if 100% of the trips were made with only one of the following modes :
+
+```{r print dist}
+dist_table <- as.matrix(viajes_dist[,13:22])
+dist <- as.data.frame(t(viajes_dist$EFACTOR_AJUST %*% dist_table /1000))
+colnames(dist) <- "distance"
+
+print(dist)
+```
+
+Now we can display the distance by mode. We can see that **traditional public transport (esp. Combi and Custer) dominates the distance (77.5%)**. Actually, both Combi and Custer represent 53.2% of the trip table sample, slightly the same proportion in modal share (i.e. taking weights into account): 55.1%.
+
+```{r Graph}
+modal <- viajes_dist %>% group_by(modo_principal_code) %>% summarize(distStraight = sum(EFACTOR_AJUST*dist_straight)/1000, distReal = sum(EFACTOR_AJUST*dist_real)/1000)
+
+modal$modo <- c("Otro", "A pie", "Bicicleta", "Moto", "Mototaxi o bicitaxi", "Auto", "Taxi", "Taxi colectivo", "Combi", "Custer", "Bus",    "BRT", "Otro", "Otro", "Otro", "Metro",  "Otro", "Otro")
+
+modal_comparado <- modal %>% group_by(modo) %>% summarize(distReal = sum(distReal), distStraight = sum(distStraight))
+
+ggplot(modal_comparado, aes(reorder(modo, -distReal), distReal))+
+  theme_bw()+
+  geom_col(fill = 'royalblue')+
+  scale_y_continuous(breaks = c(0,5000000,10000000,20000000,30000000,40000000,50000000,60000000,70000000), labels = c("0", "5", "10", "20", "30", "40", "50", "60", "70"))+
+  labs(x="Modo principal", y = "PKT (millones de viajeros.km/día)")+
+  theme(axis.text.x = element_text(angle = 15, vjust = 0.5, hjust=0.3))
+
+data <- data.frame(
+  modo = rep(modal_comparado$modo,2),
+  dist = c(modal_comparado$distReal, modal_comparado$distStraight),
+  metodo = c(rep("Red vial", 13), rep("Línea recta",13))
+)
+
+ggplot(data, aes(fill=metodo, y=reorder(modo, -dist), x=dist)) + 
+  geom_bar(position="dodge", stat="identity") +
+  coord_flip() +
+  theme_bw() +
+  scale_x_continuous(breaks = c(0,5000000,10000000,20000000,30000000,40000000,50000000,60000000,70000000), labels = c("0", "5", "10", "20", "30", "40", "50", "60", "70"))+
+  labs(x="PKT (millones de viajeros.km/día)", y = "Modo principal", fill = "Metodo") +
+  scale_fill_manual(values = c("skyblue", "royalblue"))+
+  theme(axis.text.x = element_text(angle = 15, vjust = 0.5, hjust=0.3))
+```
+
+
+# Trip examples
+
+## Regular case
+
+Most of the computations gives suitable results. Let's show some examples.
+
+```{r Example 1}
+u1 = st_geometry(ZATCentroids[ZATCentroids$TRAFFICZON == "403",])
+u2 = st_geometry(Direccion[Direccion$HOGAR == "08939",])
+
+#Computing the shortest path with Metro
+paths = st_network_paths(net_metro, from = u1, to = u2, weights = "weight")
+
+paths_metro = net_metro %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_metro$mode = "Metro"
+
+paths_metro_stops = net_metro %>%
+  activate("nodes") %>%
+  slice(unlist(paths$node_paths)) %>%
+  st_as_sf()
+
+#Computing the shortest path with BRT
+paths = st_network_paths(net_brt, from = u1, to = u2, weights = "weight")
+
+paths_brt = net_brt %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_brt$mode = "BRT"
+
+paths_brt_stops = net_brt %>%
+  activate("nodes") %>%
+  slice(unlist(paths$node_paths)) %>%
+  st_as_sf()
+
+#Displaying the result
+displayed_net_metro <- st_as_sf(net_metro, "edges")
+displayed_stops_metro <- st_as_sf(net_metro, "nodes")
+displayed_net_brt <- st_as_sf(net_brt, "edges")
+displayed_stops_brt <- st_as_sf(net_brt, "nodes")
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = displayed_net_metro, colour = "green4")+
+  geom_sf(data = displayed_stops_metro, colour = "green4") +
+  geom_sf(data = displayed_net_brt, colour = "darkblue")+
+  geom_sf(data = displayed_stops_brt, colour = "darkblue") +
+  geom_sf(data = paths_metro, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_metro_stops, colour = palette[4], linewidth = 1.2) +
+  geom_sf(data = paths_brt, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_brt_stops, colour = palette[3], linewidth = 1.2) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-77.2,-76.8), ylim = c(-12.2,-12), datum = NA)+
+  scale_colour_manual(values = palette[3:4], labels = c("BRT", "Metro"))+
+  labs(title = "Trayecto en Metro o BRT") +
+  annotation_scale(location = "bl") +
+  annotation_north_arrow(location = "tl", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Metro : ", st_network_cost(net_metro, from = u1, to = u2, weights = "weight")))
+print(paste0("BRT : ", st_network_cost(net_brt, from = u1, to = u2, weights = "weight")))
+```
+
+```{r Example 2}
+u1 = st_geometry(ZATCentroids[ZATCentroids$TRAFFICZON == "403",])
+u2 = st_geometry(Direccion[Direccion$HOGAR == "08939",])
+
+#Computing the shortest path with Bus
+paths = st_network_paths(net_bus, from = u1, to = u2, weights = "weight")
+
+paths_bus = net_bus %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_bus$mode = "Bus"
+
+
+#Computing the shortest path with Custer
+paths = st_network_paths(net_custer, from = u1, to = u2, weights = "weight")
+
+paths_custer = net_custer %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_custer$mode = "Custer"
+
+#Computing the shortest path with combi
+paths = st_network_paths(net_combi, from = u1, to = u2, weights = "weight")
+
+paths_combi = net_combi %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_combi$mode = "Combi"
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = paths_bus, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_custer, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_combi, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-77.2,-76.8), ylim = c(-12.2,-12), datum = NA)+
+  scale_colour_manual(values = palette[3:5], labels = c("Bus", "Custer", "Combi"))+
+  labs(title = "Trayecto en Bus, Combi o Custer") +
+  annotation_scale(location = "bl") +
+  annotation_north_arrow(location = "tl", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Bus : ", st_network_cost(net_bus, from = u1, to = u2, weights = "weight")))
+print(paste0("Custer : ", st_network_cost(net_custer, from = u1, to = u2, weights = "weight")))
+print(paste0("Combi : ", st_network_cost(net_combi, from = u1, to = u2, weights = "weight")))
+```
+
+```{r Example 3}
+u1 = st_geometry(Direccion[Direccion$HOGAR == "18488",])
+u2 = st_geometry(ZATCentroids[ZATCentroids$TRAFFICZON == "1201",])
+
+#Computing the shortest path with Metro
+paths = st_network_paths(net_metro, from = u1, to = u2, weights = "weight")
+
+paths_metro = net_metro %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_metro$mode = "Metro"
+
+paths_metro_stops = net_metro %>%
+  activate("nodes") %>%
+  slice(unlist(paths$node_paths)) %>%
+  st_as_sf()
+
+#Computing the shortest path with BRT
+paths = st_network_paths(net_brt, from = u1, to = u2, weights = "weight")
+
+paths_brt = net_brt %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_brt$mode = "BRT"
+
+paths_brt_stops = net_brt %>%
+  activate("nodes") %>%
+  slice(unlist(paths$node_paths)) %>%
+  st_as_sf()
+
+#Displaying the result
+displayed_net_metro <- st_as_sf(net_metro, "edges")
+displayed_stops_metro <- st_as_sf(net_metro, "nodes")
+displayed_net_brt <- st_as_sf(net_brt, "edges")
+displayed_stops_brt <- st_as_sf(net_brt, "nodes")
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = displayed_net_metro, colour = "green4")+
+  geom_sf(data = displayed_stops_metro, colour = "green4") +
+  geom_sf(data = displayed_net_brt, colour = "darkblue")+
+  geom_sf(data = displayed_stops_brt, colour = "darkblue") +
+  geom_sf(data = paths_metro, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_metro_stops, colour = palette[4], linewidth = 1.2) +
+  geom_sf(data = paths_brt, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_brt_stops, colour = palette[3], linewidth = 1.2) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-77.2,-76.6), ylim = c(-12.5,-11.9), datum = NA)+
+  scale_colour_manual(values = palette[3:4], labels = c("BRT", "Metro"))+
+  labs(title = "Trayecto en Metro o BRT") +
+  annotation_scale(location = "bl") +
+  annotation_north_arrow(location = "tr", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Metro : ", st_network_cost(net_metro, from = u1, to = u2, weights = "weight")))
+print(paste0("BRT : ", st_network_cost(net_brt, from = u1, to = u2, weights = "weight")))
+```
+
+```{r Example 4}
+u1 = st_geometry(Direccion[Direccion$HOGAR == "18488",])
+u2 = st_geometry(ZATCentroids[ZATCentroids$TRAFFICZON == "1201",])
+
+#Computing the shortest path with Bus
+paths = st_network_paths(net_bus, from = u1, to = u2, weights = "weight")
+
+paths_bus = net_bus %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_bus$mode = "Bus"
+
+
+#Computing the shortest path with Custer
+paths = st_network_paths(net_custer, from = u1, to = u2, weights = "weight")
+
+paths_custer = net_custer %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_custer$mode = "Custer"
+
+#Computing the shortest path with combi
+paths = st_network_paths(net_combi, from = u1, to = u2, weights = "weight")
+
+paths_combi = net_combi %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_combi$mode = "Combi"
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = paths_bus, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_custer, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_combi, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-77.2,-76.6), ylim = c(-12.5,-11.9), datum = NA)+
+  scale_colour_manual(values = palette[3:5], labels = c("Bus", "Custer", "Combi"))+
+  labs(title = "Trayecto en Bus, Combi o Custer") +
+  annotation_scale(location = "bl") +
+  annotation_north_arrow(location = "tr", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Bus : ", st_network_cost(net_bus, from = u1, to = u2, weights = "weight")))
+print(paste0("Custer : ", st_network_cost(net_custer, from = u1, to = u2, weights = "weight")))
+print(paste0("Combi : ", st_network_cost(net_combi, from = u1, to = u2, weights = "weight")))
+```
+
+```{r Example 5}
+u1 = st_geometry(ZATCentroids[ZATCentroids$TRAFFICZON == "317",])
+u2 = st_geometry(ZATCentroids[ZATCentroids$TRAFFICZON == "3602",])
+
+#Computing the shortest path with Bus
+paths = st_network_paths(net_bus, from = u1, to = u2, weights = "weight")
+
+paths_bus = net_bus %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_bus$mode = "Bus"
+
+
+#Computing the shortest path with Custer
+paths = st_network_paths(net_custer, from = u1, to = u2, weights = "weight")
+
+paths_custer = net_custer %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_custer$mode = "Custer"
+
+#Computing the shortest path with combi
+paths = st_network_paths(net_combi, from = u1, to = u2, weights = "weight")
+
+paths_combi = net_combi %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_combi$mode = "Combi"
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = paths_bus, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_custer, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_combi, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-77.1,-76.8), ylim = c(-12.2,-11.8), datum = NA)+
+  scale_colour_manual(values = palette[3:5], labels = c("Bus", "Custer", "Combi"))+
+  labs(title = "Trayecto en Bus, Combi o Custer") +
+  annotation_scale(location = "bl") +
+  annotation_north_arrow(location = "tr", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Bus : ", st_network_cost(net_bus, from = u1, to = u2, weights = "weight")))
+print(paste0("Custer : ", st_network_cost(net_custer, from = u1, to = u2, weights = "weight")))
+print(paste0("Combi : ", st_network_cost(net_combi, from = u1, to = u2, weights = "weight")))
+```
+
+```{r Example 6}
+u1 = st_geometry(ZATCentroids[ZATCentroids$TRAFFICZON == "1002",])
+u2 = st_geometry(ZATCentroids[ZATCentroids$TRAFFICZON == "3203",])
+
+#Computing the shortest path with Bus
+paths = st_network_paths(net_bus, from = u1, to = u2, weights = "weight")
+
+paths_bus = net_bus %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_bus$mode = "Bus"
+
+
+#Computing the shortest path with Custer
+paths = st_network_paths(net_custer, from = u1, to = u2, weights = "weight")
+
+paths_custer = net_custer %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_custer$mode = "Custer"
+
+#Computing the shortest path with combi
+paths = st_network_paths(net_combi, from = u1, to = u2, weights = "weight")
+
+paths_combi = net_combi %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_combi$mode = "Combi"
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = paths_bus, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_custer, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_combi, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-77.1,-76.9), ylim = c(-12.1,-11.9), datum = NA)+
+  scale_colour_manual(values = palette[3:5], labels = c("Bus", "Custer", "Combi"))+
+  labs(title = "Trayecto en Bus, Combi o Custer") +
+  annotation_scale(location = "bl") +
+  annotation_north_arrow(location = "tr", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Bus : ", st_network_cost(net_bus, from = u1, to = u2, weights = "weight")))
+print(paste0("Custer : ", st_network_cost(net_custer, from = u1, to = u2, weights = "weight")))
+print(paste0("Combi : ", st_network_cost(net_combi, from = u1, to = u2, weights = "weight")))
+```

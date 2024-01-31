@@ -1,0 +1,1481 @@
+---
+title: "Lima distance mapping EN"
+author: "[Hugo Thomas](https://perso.univ-rennes2.fr/hugo.thomas)"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    code_folding: "hide"
+---
+
+# Introduction
+
+This Markdown does the following:
+
+* Mapping the distance.
+* Mapping GHG.
+* Mapping air pollution
+
+# Preliminary work
+
+## Defining the working environment
+
+```{r setup, include=FALSE}
+    knitr::opts_chunk$set(warning = FALSE, message = FALSE, verbose = FALSE)
+    knitr::opts_chunk$set(dev = "png",
+                          dpi = 300,
+                          echo = TRUE,
+                          cache = TRUE)
+```
+
+For the moment the data is stored locally. We will further put a link to download the data.
+```{r eval = FALSE}
+setwd("C:/Users/hugot/Documents/Rennes 2/Calcul distance SIG/Reprise perso/RMD Lima")
+```
+
+## Loading packages
+
+```{r Packages}
+library(sfnetworks)
+library(dodgr)
+library(sf)
+library(sp)
+library(spdep)
+library(geoR)
+library(spatstat)
+library(tidygraph)
+library(data.table)
+library(dplyr)
+library(purrr)
+library(TSP)
+library(openxlsx)
+library(raster)
+library(stars)
+library(terra)
+library(ggplot2)
+library(ggspatial)
+library(knitr)
+library(tidyr)
+library(cartography)
+```
+
+
+## Loading the data
+
+```{r Data}
+viajes_dist <- read.xlsx("Tables produites/Viajes_dist_v3.xlsx")
+ZAT <- st_read(dsn = "Data", layer = "ZAT") %>% st_transform(4326)              # ZAT boundaries
+Direccion <- st_read(dsn = "Data", layer = "Dir_hogares")                       # Household address
+People <- read.xlsx("Data/Personas.xlsx")                                       # Weighted people table
+contour <- st_read(dsn = "Data", layer = "contour") %>% st_transform(32718)     # edge of the city
+EF <- read.xlsx("Data/facteurs d'émissions.xlsx")                               # emission factors
+limites_lima <- st_read(dsn = "Data", layer = "distritos") %>%                  # District boundaries
+  st_transform(4326) 
+conos_lima <- st_read(dsn = "Data", layer = "Conos") %>%                        # Inter-district area boundaries
+  st_transform(4326)
+BRT <- st_read(dsn = "Data", layer = "MetropolitanoAlimentador")                # BRT network
+```
+
+
+## Defining the names to be displayed
+
+```{r names districts}
+limites_lima <- st_make_valid(limites_lima)
+centroides_limites_lima <- st_centroid(limites_lima) %>%
+  mutate(lon = st_coordinates(.)[,1],
+         lat = st_coordinates(.)[,2])
+
+conos_lima <- st_make_valid(conos_lima)
+centroides_conos_lima <- st_centroid(conos_lima) %>%
+  mutate(lon = c(-77.12,-77.09,-76.75,-77.01,-76.81),
+         lat = c(-12.06,-12.13,-12.03,-11.80,-12.17))
+
+centroides_limites_lima$DISPLAY <- centroides_limites_lima$DISTRNOMBR
+centroides_limites_lima$DISPLAY[!(centroides_limites_lima$DISTRNOMBR %in% c("VENTANILLA", "SAN JUAN DE LURIGANCHO", "LURIGANCHO (CHOSICA)", "LURIN", "VILLA EL SALVADOR", "LA MOLINA", "SAN BORJA", "MIRAFLORES", "PACHACAMAC", "SAN JUAN DE MIRAFLORES", "SANTIAGO DE SURCO", "SANTA ANITA", "LA VICTORIA", "MAGDALENA DEL MAR", "LA PUNTA", "ATE", "INDEPENDENCIA", "CALLAO", "COMAS", "LIMA", "LA PERLA", "CHORRILLOS", "LA PUNTA", "SAN ISIDRO"))] <- ""
+centroides_limites_lima$DISPLAY[centroides_limites_lima$DISTRNOMBR == "SAN JUAN DE LURIGANCHO"] <-"SAN JUAN DE \nLURIGANCHO"
+centroides_limites_lima$DISPLAY[centroides_limites_lima$DISTRNOMBR == "SAN BORJA"] <-"SAN \nBORJA"
+centroides_limites_lima$DISPLAY[centroides_limites_lima$DISTRNOMBR == "SAN ISIDRO"] <-"SAN \nISIDRO"
+centroides_limites_lima$DISPLAY[centroides_limites_lima$DISTRNOMBR == "SAN JUAN DE MIRAFLORES"] <-"SAN JUAN DE \nMIRAFLORES"
+centroides_limites_lima$DISPLAY[centroides_limites_lima$DISTRNOMBR == "MAGDALENA DEL MAR"] <-"MAGDALENA \nDEL MAR"
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "ATE"] <- -76.84
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "PACHACAMAC"] <- -76.87
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "VENTANILLA"] <- -77.12
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "SAN ISIDRO"] <- -77.025
+centroides_limites_lima$lon[centroides_limites_lima$DISTRNOMBR == "LA PUNTA"] <- -77.18
+centroides_limites_lima$lat[centroides_limites_lima$DISTRNOMBR == "LA PUNTA"] <- -12.075
+centroides_limites_lima$lat[centroides_limites_lima$DISTRNOMBR == "VENTANILLA"] <- -11.91
+centroides_limites_lima$lat[centroides_limites_lima$DISTRNOMBR == "LA MOLINA"] <- -12.11
+centroides_limites_lima$lat[centroides_limites_lima$DISTRNOMBR == "SANTIAGO DE SURCO"] <- -12.14
+centroides_conos_lima$lat[centroides_conos_lima$cono == "Callao"] <- -12.04
+```
+
+## Defining the map zoom level and extent
+
+The same zoom level is chosen for Bogotá and Lima for comparison purpose
+
+```{r zoom extent}
+zoom_level <- 9.5
+lon_span <- 360 / 2^zoom_level
+lat_span <- 360 / 2^zoom_level
+
+zoom_to_Lima <- c(-76.94, -12.05)  # Lima
+lon_bounds_Lima <- c(zoom_to_Lima[1] - lon_span / 2, zoom_to_Lima[1] + lon_span / 2)
+lat_bounds_Lima <- c(zoom_to_Lima[2] - lat_span / 2, zoom_to_Lima[2] + lat_span / 2)
+```
+
+# Distance mapping
+
+## Regular mapping
+
+```{r Distance ZAT}
+Dist_ZAT <- viajes_dist[,c(1,12,22)] %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(dist = sum(EFACTOR_AJUST*dist_real/1000))
+  
+ZAT <- ZAT %>% left_join(Dist_ZAT, by = "TRAFFICZON")
+
+bks = c(0,100000,200000,500000,1000000,1500000,2200000)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = dist))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#fafaaa", high = "#bb2b30")+
+  scale_color_manual(values = c("grey", "black"))+
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Total daily PKT per \nZAT of residence", fill = "Total passengers-km per day", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.80, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Distance work}
+Dist_ZAT <- viajes_dist[,c(1,8,12,22)] %>%
+  filter(P36_01 == 1) %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(dist_work = sum(EFACTOR_AJUST*dist_real/1000))
+  
+ZAT <- ZAT %>% left_join(Dist_ZAT, by = "TRAFFICZON")
+
+bks = c(20000,50000,100000,200000,500000)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = dist_work))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#fafaaa", high = "#bb2b30", labels = c("20000", "50000", "100000", "200000", "500000"))+
+  scale_color_manual(values = c("grey", "black"))+
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Commuting to work", fill = "Passengers-km per day", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.80, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Dist study}
+Dist_ZAT <- viajes_dist[,c(1,8,12,22)] %>%
+  filter(P36_01 == 2) %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(dist_school = sum(EFACTOR_AJUST*dist_real/1000))
+  
+ZAT <- ZAT %>% left_join(Dist_ZAT, by = "TRAFFICZON")
+#ZAT$dist_work[is.na(ZAT$dist_work)] <- 0
+
+bks = c(10000,20000,50000,100000,200000)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = dist_school))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#fafaaa", high = "#bb2b30", labels = c("10000", "20000", "50000", "100000", "200000"))+
+  scale_color_manual(values = c("grey", "black"))+
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Going to school \nor university", fill = "Passengers-km per day", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.80, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Dist leisure}
+Dist_ZAT <- viajes_dist[,c(1,8,12,22)] %>%
+  filter(P36_01 %in% c(6,8,9)) %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(dist_leisure = sum(EFACTOR_AJUST*dist_real/1000))
+  
+ZAT <- ZAT %>% left_join(Dist_ZAT, by = "TRAFFICZON")
+#ZAT$dist_work[is.na(ZAT$dist_work)] <- 0
+
+bks = c(1000,2000,5000,20000,30000)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = dist_leisure))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#fafaaa", high = "#bb2b30", na.value = "grey80")+
+  scale_color_manual(values = c("grey", "black"))+
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Leisure or physical activity", fill = "Passengers-km per day", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.80, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Dist walk}
+Dist_ZAT <- viajes_dist[,c(1,10,12,22)] %>%
+  filter(modo_principal_code == 1) %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(dist_walk = sum(EFACTOR_AJUST*dist_real/1000))
+  
+ZAT <- ZAT %>% left_join(Dist_ZAT, by = "TRAFFICZON")
+#ZAT$dist_work[is.na(ZAT$dist_work)] <- 0
+
+#bks = c(0.1,0.2,0.3,0.5,1)
+bks_walk <- round(as.numeric(quantile(ZAT$dist_walk/ZAT$NUMERO_PER, probs = c(0,0.1,0.25,0.5,0.75,0.9), na.rm = TRUE)),2)
+bks <- bks_walk
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = dist_walk/NUMERO_PER))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#f8f8f8", high = "#103D82", na.value = "grey80")+
+  scale_color_manual(values = c("grey", "black"))+
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Walking", fill = "Average daily distance per capita (km)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Dist car}
+Dist_ZAT <- viajes_dist[,c(1,10,12,22)] %>%
+  filter(modo_principal_code == 5) %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(dist_car = sum(EFACTOR_AJUST*dist_real/1000))
+  
+ZAT <- ZAT %>% left_join(Dist_ZAT, by = "TRAFFICZON")
+
+#bks = c(0.5,1,2,5,10)
+bks_car <- round(as.numeric(quantile(ZAT$dist_car/ZAT$NUMERO_PER, probs = c(0,0.1,0.25,0.5,0.75,0.9), na.rm = TRUE)),2)
+bks <- bks_car
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = dist_car/NUMERO_PER))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#f8f8f8", high = "#103D82", na.value = "grey80")+
+  scale_color_manual(values = c("grey", "black"))+
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Private car", fill = "Average daily distance per capita (km)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Dist combi}
+Dist_ZAT <- viajes_dist[,c(1,10,12,22)] %>%
+  filter(modo_principal_code == 8) %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(dist_combi = sum(EFACTOR_AJUST*dist_real/1000))
+  
+ZAT <- ZAT %>% left_join(Dist_ZAT, by = "TRAFFICZON")
+#ZAT$dist_work[is.na(ZAT$dist_work)] <- 0
+
+bks = c(0.5,1,2,5,10)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = dist_combi/NUMERO_PER))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#f8f8f8", high = "#103D82", na.value = "grey80")+
+  scale_color_manual(values = c("grey", "black"))+
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Combi (Paratransit)", fill = "Average daily distance per capita (km)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Dist BRT}
+Dist_ZAT <- viajes_dist[,c(1,10,12,22)] %>%
+  filter(modo_principal_code == 11) %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(dist_brt = sum(EFACTOR_AJUST*dist_real/1000))
+  
+ZAT <- ZAT %>% left_join(Dist_ZAT, by = "TRAFFICZON")
+#ZAT$dist_work[is.na(ZAT$dist_work)] <- 0
+
+bks = c(0.2,0.5,1,1.5,2)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = dist_brt/NUMERO_PER))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_sf(data = BRT, aes(linetype = "BRT (Metropolitano)"), color = "red", linewidth = 0.4)+
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#f8f8f8", high = "#103D82", na.value = "grey80")+
+  scale_color_manual(values = c("grey", "black"))+
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Bus Rapid Transit (BRT)", fill = "Average daily distance per capita (km)", color = "", linetype = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+```{r Dist all public transport}
+Dist_ZAT <- viajes_dist[,c(1,10,12,22)] %>%
+  filter(modo_principal_code %in% c(8:11,15)) %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(dist_transit = sum(EFACTOR_AJUST*dist_real/1000))
+  
+ZAT <- ZAT %>% left_join(Dist_ZAT, by = "TRAFFICZON")
+#ZAT$dist_work[is.na(ZAT$dist_work)] <- 0
+
+test <- 0
+
+#bks = c(5,8,10,15,20)
+bks_transit <- round(as.numeric(quantile(ZAT$dist_transit/ZAT$NUMERO_PER, probs = c(0,0.1,0.25,0.5,0.75,0.9), na.rm = TRUE)),2)
+bks <- bks_transit
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = dist_transit/NUMERO_PER))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#f8f8f8", high = "#103D82", na.value = "grey80")+
+  scale_color_manual(values = c("grey", "black"))+
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Public transport", fill = "Average daily distance per capita (km)", color = "", linetype = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+## Spatial smoothing
+
+### Preliminary work
+
+```{r Nearest neighbours}
+ZAT <- ZAT %>% st_transform(32718)
+ZATCentroids <- st_centroid(ZAT)
+    
+listPPV <- knearneigh(ZATCentroids, k = 1, longlat = TRUE) # Finding each ZAT nearest neighbor
+PPV <- knn2nb(listPPV, row.names = ZAT$TRAFFICZON) # Coercing knn objects into nb objects
+distPPV <- nbdists(PPV, ZATCentroids) # Computing the distance between nearest neighbors
+print(as.data.frame(t(as.matrix(summary(unlist(distPPV))))))
+
+hist(unlist(distPPV), breaks = 20,
+    main = "Distance to the closest neighbor",
+    col = "black", border = "white", xlab = "Distance", ylab = "Frequence")
+```
+```{r Moran I}
+nb <- poly2nb(pl = ZAT, snap = 50, queen = TRUE)
+summary(nb)
+
+ZAT <- ZAT[ZAT$fid != 335,]
+nb <- poly2nb(pl = ZAT, snap = 50, queen = TRUE)
+#moran.test(ZAT$dist, listw = nb2listw(nb))
+
+ZAT$dist_leisure[is.na(ZAT$dist_leisure)] <- 0
+
+moran <- c(0*(1:4))
+for(i in 1:4){
+m <- moran.test(data.frame(ZAT[,36+i])[,1], listw = nb2listw(nb))
+moran[i] <- round(as.numeric(m$estimate[1]), digits = 2)
+}
+
+# Displaying the Moran's I
+df <- data.frame(cbind(as.numeric(moran),motivo = c("Total", "Trabajo", "Estudio", "Esparcimiento")))
+ggplot(df) +  
+    theme_classic() +
+    geom_point(aes(x = motivo, y=moran), shape = 21, fill = "white", color = "black", size = 2, stroke = 0.5)  +
+    labs(x="Trip purpose", y="Moran") +
+    theme(legend.position = "left", 
+      panel.border = element_rect(colour = "black", fill=NA, size=0.5),
+      )
+```
+```{r Variogram of the total distance}
+ZATCentroids <- st_centroid(ZAT)
+ZATCentroids <- as(ZATCentroids, "Spatial")
+ZATCentroids.geodata <- as.geodata(ZATCentroids, data.col = "dist")
+
+vario.ex<- variog(ZATCentroids.geodata, bin.cloud=TRUE, option = "bin")
+plot(vario.ex, main = "Semivariogram of the computed daily distance", cex.main = 1)
+lines(vario.ex, type ="l", lty = 2, col="red", add = TRUE)
+```
+
+### Smoothed maps
+
+```{r Smoothed map total distance}
+colors <- c("#f9f5a7", "#f7eca0", "#f3d893", "#e9b179", "#d9805a","#c64c3e")
+bks = c(0,100000,200000,500000,1000000,1500000,2200000)
+
+# Defining the edge of Lima as the extent of the map
+Emprise = as.owin(st_buffer(ZAT,0))
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = ZAT$dist)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(50000))
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 100000","100000 - 200000","200000 - 500000","500000 - 1000000","1000000 - 1500000","> 1500000"))+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Total daily PKT per \nZAT of residence", fill = "Total passengers-km per day", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.80, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+```{r Smoothed map work distance}
+#Creating a color palette
+colors <- c("#f9f5a7", "#f7eca0", "#f3d893", "#e9b179", "#d9805a","#c64c3e")
+bks = c(0,20000,50000,100000,200000,500000,1000000)
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = ZAT$dist_work)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(20000))
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 20,000","20,000 - 50,000","50,000 - 100,000","100,000 - 200,000","200,000 - 500,000","> 500,000"))+
+  scale_color_manual(values = c("grey", "black"))+
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Commuting to work", fill = "Passengers-km per day", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.80, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+```{r Smoothed map study distance}
+#Creating a color palette
+colors <- c("#f9f5a7", "#f7eca0", "#f3d893", "#e9b179", "#d9805a","#c64c3e")
+bks = c(0,10000,20000,50000,100000,200000,500000)
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = ZAT$dist_school)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(50000))
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 10000","10000 - 20000","20000 - 50000","50000 - 100000","100000 - 200000","> 200000"))+
+  scale_color_manual(values = c("grey", "black"))+  
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Going to school \nor university", fill = "Passengers-km per day", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.80, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+```{r Smoothed map leisure distance}
+#Creating a color palette
+colors <- c("#f9f5a7", "#f7eca0", "#f3d893", "#e9b179", "#d9805a","#c64c3e")
+bks = c(0,1000,2000,5000,20000,30000,50000)
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = ZAT$dist_leisure)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(50000))
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 1000","1000 - 2000","2000 - 5000","5000 - 20000","20000 - 30000","> 30000"))+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Leisure or physical activity", fill = "Passengers-km per day", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.80, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+```{r Smoothed map walking distance}
+ZAT$dist_walk[is.na(ZAT$dist_walk)] <- 0
+
+#Creating a color palette
+colors <- c("#efeff3", "#dddee9", "#caccde", "#aeb1ce", "#6c77a9","#284689")
+#bks = c(0,0.1,0.2,0.3,0.5,1,2)
+bks <- c(bks_walk,100)
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = ZAT$dist_walk/ZAT$NUMERO_PER)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(20000))
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 0.07","0.07 - 0.15","0.15 - 0.26","0.26 - 0.42","0.42 - 0.6","> 0.6"))+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Walking", fill = "Average daily distance per capita (km)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+```{r Smoothed map car distance}
+ZAT$dist_car[is.na(ZAT$dist_car)] <- 0
+
+#Creating a color palette
+colors <- c("#efeff3", "#dddee9", "#caccde", "#aeb1ce", "#6c77a9","#284689")
+#bks = c(0,0.5,1,2,5,10,50)
+bks <- c(bks_car,100)
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = ZAT$dist_car/ZAT$NUMERO_PER)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(20000))
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 0.15","0.15 - 0.39","0.39 - 0.83","0.83 - 2.07","2.07 - 5.17","> 5.17"))+
+  scale_color_manual(values = c("grey", "black"))+  
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Private car", fill = "Average daily distance per capita (km)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+```{r Smoothed map combi distance}
+ZAT$dist_combi[is.na(ZAT$dist_combi)] <- 0
+
+#Creating a color palette
+colors <- c("#efeff3", "#dddee9", "#caccde", "#aeb1ce", "#6c77a9","#284689")
+bks = c(0,0.5,1,2,5,10,50)
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = ZAT$dist_combi/ZAT$NUMERO_PER)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(50000))
+
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 0.5","0.5 - 1","1 - 2","2 - 5","5 - 10","> 10"))+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Combi (paratransit)", fill = "Average daily distance per capita (km)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+```{r Smoothed map all public transport distance}
+ZAT$dist_transit[is.na(ZAT$dist_transit)] <- 0
+
+#Creating a color palette
+colors <- c("#efeff3", "#dddee9", "#caccde", "#aeb1ce", "#6c77a9","#284689")
+#bks = c(0,5,8,10,15,20,50)
+bks <- c(bks_transit,100)
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = ZAT$dist_transit/ZAT$NUMERO_PER)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(20000))
+
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 4.34","4.34 - 6.75", "6.75 - 9.46", "9.46 - 13.16","13.16 - 16.28","> 16.28"))+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "Public transport", fill = "Average daily distance per capita (km)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+# Greenhouse gas emissions and air pollutants mapping
+
+## Computing emissions
+
+```{r computing the emissions of each trip}
+viajes_dist <- viajes_dist %>% left_join(EF, by = "modo_principal_code")
+
+viajes_dist$`CO2-eq` <- viajes_dist$`CO2-eq`*viajes_dist$dist_real/1000
+viajes_dist$CO <- viajes_dist$CO*viajes_dist$dist_real/1000
+viajes_dist$NOx <- viajes_dist$NOx*viajes_dist$dist_real/1000
+viajes_dist$BC <- viajes_dist$BC*viajes_dist$dist_real/1000
+viajes_dist$COV <- viajes_dist$COV*viajes_dist$dist_real/1000
+viajes_dist$PM <- viajes_dist$PM*viajes_dist$dist_real/1000
+```
+
+## Statistics
+
+```{r emissions statistics}
+emissions_mode <- viajes_dist[,c(10,12,22,25,26:31)] %>%
+  group_by(modo_principal) %>%
+  summarize(`CO2-eq` = sum(EFACTOR_AJUST*`CO2-eq`), CO = sum(EFACTOR_AJUST*CO), NOx = sum(EFACTOR_AJUST*NOx), BC = sum(EFACTOR_AJUST*BC), COV = sum (EFACTOR_AJUST*COV), PM = sum(EFACTOR_AJUST*PM), modo_principal_code = unique(modo_principal_code))
+
+#CO2 emissions are converted in metric tons.
+emissions_mode$`CO2-eq` <- emissions_mode$`CO2-eq`/1000000
+
+#CO emissions are converted in metric tons.
+emissions_mode$CO <- emissions_mode$CO/1000000
+
+#NOx emissions are converted in metric tons.
+emissions_mode$NOx <- emissions_mode$NOx/1000000
+
+#PM emissions are converted in kg.
+emissions_mode$PM <- emissions_mode$PM/1000
+
+#CO2 emissions
+ggplot(emissions_mode, aes(reorder(modo_principal, -`CO2-eq`), `CO2-eq`))+
+  theme_bw()+
+  geom_col(fill = 'darkorange2')+
+  labs(x="Main mode", y = "Greenhouse gas emissions (tCO2-eq/day)")+
+  theme(axis.text.x = element_text(angle = 20, vjust = 0.5, hjust=1))
+
+#CO emissions
+ggplot(emissions_mode, aes(reorder(modo_principal, -CO), CO))+
+  theme_bw()+
+  geom_col(fill = 'darkgreen')+
+  labs(x="Main mode", y = "Carbon monoxyde emissions (tCO/day)")+
+  theme(axis.text.x = element_text(angle = 20, vjust = 0.5, hjust=1))
+
+#NOx emissions
+ggplot(emissions_mode, aes(reorder(modo_principal, -NOx), NOx))+
+  theme_bw()+
+  geom_col(fill = 'royalblue')+
+  labs(x="Main mode", y = "Nitrogen oxydes emissions (t/day)")+
+  theme(axis.text.x = element_text(angle = 20, vjust = 0.5, hjust=1))
+
+#PM  emissions
+ggplot(emissions_mode, aes(reorder(modo_principal, -PM), PM))+
+  theme_bw()+
+  geom_col(fill = 'darkred')+
+  labs(x="Main mode", y = "PM Emissions (kg/day)")+
+  theme(axis.text.x = element_text(angle = 20, vjust = 0.5, hjust=1))
+
+```
+
+## Mapping emissions 
+
+### Total emissions
+
+```{r Reinitializing some tables}
+ZAT <- st_read(dsn = "Data", layer = "ZAT") %>% st_transform(4326)              # ZAT boundaries
+contour <- st_read(dsn = "Data", layer = "contour") %>% st_transform(4326)      # edge of the city
+```
+
+
+```{r Mapping CO2 emissions}
+Emissions_ZAT <- viajes_dist[,c(1,12,26)] %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(CO2 = sum(EFACTOR_AJUST*`CO2-eq`/1000000))
+  
+ZAT <- ZAT %>% left_join(Emissions_ZAT, by = "TRAFFICZON")
+
+bks = c(20,50,70,100,150)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = CO2))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#fafaaa", high = "darkorange2")+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "GHG Emissions \nper ZAT of residence", fill = "Total emissions (tCO2-eq/day)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Mapping CO emissions}
+Emissions_ZAT <- viajes_dist[,c(1,12,27)] %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(CO = sum(EFACTOR_AJUST*CO/1000000))
+  
+ZAT <- ZAT %>% left_join(Emissions_ZAT, by = "TRAFFICZON")
+
+bks = c(0.05,0.1,0.2,0.4,0.6)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = CO))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#fafaaa", high = "darkgreen")+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "CO Emissions \nper ZAT of residence", fill = "Total emissions (tCO/day)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Mapping NOx emissions}
+Emissions_ZAT <- viajes_dist[,c(1,12,28)] %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(NOx = sum(EFACTOR_AJUST*NOx/1000000))
+  
+ZAT <- ZAT %>% left_join(Emissions_ZAT, by = "TRAFFICZON")
+
+bks = c(0.02,0.05,0.08,0.2,0.3)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = NOx))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#ebf7ff", high = "royalblue")+
+  scale_color_manual(values = c("grey", "black"))+  
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "NOx Emissions \nper ZAT of residence", fill = "Total emissions (tNOx/day)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Mapping PM emissions}
+Emissions_ZAT <- viajes_dist[,c(1,12,31)] %>%
+  left_join(Direccion[,c(2,4)], by = "HOGAR") %>%
+  group_by(TRAFFICZON)%>%
+  summarize(PM = sum(EFACTOR_AJUST*PM/1000))
+  
+ZAT <- ZAT %>% left_join(Emissions_ZAT, by = "TRAFFICZON")
+
+bks = c(0.5,1,2,5,12)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = PM))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#fafaaa", high = "darkred")+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "PM Emissions \nper ZAT of residence", fill = "Total emissions (kg PM/day)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+### Emissions per capita
+
+```{r Mapping per capita CO2 emissions}
+bks = c(0.5,0.6,0.8,1,2)
+bks_co2 <- round(as.numeric(quantile(1000*ZAT$CO2/ZAT$NUMERO_PER, probs = c(0,0.1,0.25,0.5,0.75,0.9), na.rm = TRUE)),2)
+bks <- bks_co2
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = 1000*CO2/NUMERO_PER))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#fafaaa", high = "darkorange2")+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "GHG Emissions per capita \nper ZAT of residence", fill = "Average daily emissions per capita (kg CO2-eq)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Mapping per capita CO emissions}
+bks = c(2,5,10,20,30)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = 1000000*CO/NUMERO_PER))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#fafaaa", high = "darkgreen")+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "CO Emissions per capita \nper ZAT of residence", fill = "Average daily emissions per capita (g CO)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Mapping per capita NOx emissions}
+bks = c(1,2,3,4,6)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = 1000000*NOx/NUMERO_PER))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#ebf7ff", high = "royalblue")+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "NOx Emissions per capita \nper ZAT of residence", fill = "Average daily emissions per capita (g NOx)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+```{r Mapping per capita PM emissions}
+bks = c(50,80,100,150,200)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, color = NA, aes(fill = 1000000*PM/NUMERO_PER))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_steps(breaks = bks, low = "#fafaaa", high = "darkred")+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "PM Emissions per capita \nper ZAT of residence", fill = "Average daily emissions per capita (mg PM)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.75, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+
+### Smoothed emissions per capita
+
+```{r Moran I 2}
+nb <- poly2nb(pl = ZAT, snap = 50, queen = TRUE)
+summary(nb)
+
+ZAT <- ZAT[ZAT$fid != 335,]
+nb <- poly2nb(pl = ZAT, snap = 50, queen = TRUE)
+#moran.test(ZAT$dist, listw = nb2listw(nb))
+
+ZAT$CO2[is.na(ZAT$CO2)] <- 0
+ZAT$CO[is.na(ZAT$CO)] <- 0
+ZAT$NOx[is.na(ZAT$NOx)] <- 0
+ZAT$PM[is.na(ZAT$PM)] <- 0
+
+moran <- c(0*(1:4))
+for(i in 1:4){
+m <- moran.test(data.frame(ZAT[,36+i]/ZAT$NUMERO_PER)[,1], listw = nb2listw(nb))
+moran[i] <- round(as.numeric(m$estimate[1]), digits = 2)
+}
+
+# Displaying the Moran's I
+df <- data.frame(cbind(as.numeric(moran),motivo = c("GEI", "CO", "NOx", "PM")))
+ggplot(df) +  
+    theme_classic() +
+    geom_point(aes(x = motivo, y=moran), shape = 21, fill = "white", color = "black", size = 2, stroke = 0.5)  +
+    labs(x="Tipo de emisión", y="Moran") +
+    theme(legend.position = "left", 
+      panel.border = element_rect(colour = "black", fill=NA, size=0.5),
+      )
+```
+```{r Smoothed map CO2 per capita}
+#ZAT must now be in projected coordinates
+ZAT <- ZAT %>% st_transform(32718)
+
+#Creating a color palette
+colors <- c("#FAFAAA", "#F7DF88", "#F5C565", "#F2AA43", "#F09021", "#EE7600")
+#bks = c(0,0.5,0.6,0.8,1,2,5)
+bks = c(bks_co2,50)
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = 1000*ZAT$CO2/ZAT$NUMERO_PER)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(20000))
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 0.46","0.46 - 0.60","0.60 - 0.75","0.75 - 0.99","0.99 - 1.32","> 1.32"))+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "GHG Emissions per capita", fill = "Average daily emissions per capita (kg CO2-eq)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.72, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Smoothed map CO per capita}
+#Creating a color palette
+colors <- c("#FAFAAA", "#C8DB88", "#95BE65", "#63A043", "#318221", "#006400")
+bks = c(0,2,5,10,20,30,50)
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = 1000000*ZAT$CO/ZAT$NUMERO_PER)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(20000))
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 2","2 - 5","5 - 10","10 - 20","20 - 30","> 30"))+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "CO Emissions per capita", fill = "Average daily emissions per capita (g CO)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.72, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Smoothed map NOx per capita}
+#Creating a color palette
+colors <- c("#EBF7FF", "#C9DAF9", "#A6BEF3", "#84A1ED", "#6285E7", "#4169E1")
+bks = c(0,1,2,3,4,6,10)
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = 1000000*ZAT$NOx/ZAT$NUMERO_PER)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(50000))
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 1","1 - 2","2 - 3","3 - 4","4 - 6","> 6"))+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "NOx Emissions per capita", fill = "Average daily emissions per capita (g NOx)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.72, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```
+```{r Smoothed map PM per capita}
+#Creating a color palette
+colors <- c("#FAFAAA", "#E3C888", "#CD9565", "#B76343", "#A13121", "#8B0000")
+bks = c(0,50,80,100,150,200,250)
+
+# Creating a ppp object (spatstat) and including the extent and values to be smoothed (i.e. the multiplication factor at 12.00 pm) 
+ZAT.ppp <- ppp(ZATCentroids@coords[,1], ZATCentroids@coords[,2], window = Emprise, marks = 1000000*ZAT$PM/ZAT$NUMERO_PER)
+
+# Computing the smoothed surface (smoothing bandwidth: 1 km and picture spatial resolution: 1 ha) --> takes some time
+cartelissee <- Smooth(ZAT.ppp, kernel = "gaussian", sigma = 800, weights = ZAT.ppp$marks, eps=sqrt(50000))
+
+# Coercing the smoothed surface into a raster
+cartelissee.raster <- raster(cartelissee)
+crs(cartelissee.raster) <- st_crs(ZAT)$srid # to specify a CRS to the raster object
+
+# Reclassifying the smoothed surface
+cartelissee.reclass <- cut(cartelissee.raster, breaks = bks)
+
+# Vectorizing the reclassed surface
+cartelissee.vecteur <- st_as_sf(st_as_stars(cartelissee.reclass), as_points = FALSE, merge = TRUE) # requires the sf, sp, raster and stars packages
+
+# Sorting the layer column information
+cartelissee.vecteur <- cartelissee.vecteur[order(cartelissee.vecteur$layer, decreasing = FALSE), ] %>% st_transform(4326)
+
+# Configuring the window margins to maximize the extent of the map
+par(mar = c(0, 0, 0, 0))
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = cartelissee.vecteur, color = NA, aes(fill = factor(layer)))+
+  geom_sf(data = limites_lima, fill = NA, aes(color = "District boundary"))+
+  #geom_sf(data = contour, colour = "grey30", fill = NA) +
+  geom_text(data= centroides_limites_lima,aes(x=lon, y=lat, label = DISPLAY), color = "black", fontface = "plain", size = 1.5, check_overlap = FALSE) +
+  geom_sf(data = conos_lima, fill = NA, aes(color = "Interdistrict area"))+
+  geom_text(data= centroides_conos_lima,aes(x=lon, y=lat, label=cono),
+            color = "black", fontface = "bold", size = 3, check_overlap = FALSE) +
+  #geom_segment(aes(x = -77.09, y = -12.12, xend = -77.02, yend = -12.1), lineend = "butt", linejoin = "mitre", lwd = 1, arrow = arrow(length = unit(0.2, "cm")))+
+  scale_fill_manual(values = colors, labels = c("< 50","50 - 80","80 - 100","100 - 150","150 - 200","> 200"))+
+  scale_color_manual(values = c("grey", "black"))+   
+  coord_sf(xlim = lon_bounds_Lima, ylim = lat_bounds_Lima, datum = NA)+
+  labs(tag = "PM Emissions per capita", fill = "Average daily emissions per capita (mg PM)", color = "") +
+  theme(plot.tag = element_text(size = 9, face = "bold", hjust = 0), plot.tag.position = c(0.72, 0.9),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size=8),
+        legend.text.align = 1)+
+  guides(color = guide_legend(label.hjust = 0, order = 1))+
+  labs(x = "", y = "") +
+  annotation_scale(location = "bl", height = unit(0.12, "cm"),text_cex = 0.4) +
+  annotation_north_arrow(location = "tr", which_north = "true", height = unit(0.5, "cm"), width = unit(0.5, "cm"), style = north_arrow_orienteering(text_size = 4))
+```

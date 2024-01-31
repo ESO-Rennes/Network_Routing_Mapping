@@ -1,0 +1,1902 @@
+---
+title: "Bogota_Routing_Distance_v4"
+author: "[Hugo Thomas](https://perso.univ-rennes2.fr/hugo.thomas)"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    code_folding: "hide"
+---
+
+# Introduction
+
+This Markdown does the following:
+
+* Counting the number of occurrences of each OD pair in the trips database and producing a heatmap. 
+* Providing a sensibility test of the location of the start and end point in each zone (UTAM and ZAT)
+* Computing distance for each mode on the active OD pairs only, for ZAT and UTAM, with sensibility analysis.
+* Producing basic statistics about distance in Bogotá.
+* Showing trip examples.
+
+# Preliminary work
+
+## Defining the working environment
+
+```{r setup, include=FALSE}
+    knitr::opts_chunk$set(warning = FALSE, message = FALSE, verbose = FALSE, error = TRUE)
+    knitr::opts_chunk$set(dev = "png",
+                              dpi = 300,
+                              echo = TRUE,
+                              cache = TRUE)
+```
+
+For the moment the data is stored locally. We will further put a link to download the data.
+```{r}
+setwd("C:/Users/hugot/Documents/Rennes 2/Calcul distance SIG/Reprise perso/RMD Bogota")
+```
+
+## Loading packages
+
+```{r}
+library(sfnetworks)
+library(dodgr)
+library(sf)
+library(sp)
+library(tidygraph)
+#library(tidytransit)
+#library(osmextract)
+library(r5r)
+library(data.table)
+library(dplyr)
+library(purrr)
+library(TSP)
+library(openxlsx)
+library(terra)
+#library(rgeos)
+library(ggplot2)
+library(ggspatial)
+library(knitr)
+library(tidyr)
+#library(cppRouting)
+library(foreach)
+library(doFuture)
+```
+
+## Loading the data
+
+This Markdown requires at least the following inputs (to be used with the _sfnetworks_ and _dodgr_ packages):
+
+* a trip table (.xlsx or .csv) from an urban mobility survey with, for each trip: 
+  + the zone of origin and the zone of destination
+  + the main mode
+* a .shp file with the boundaries of the zones.
+* a .shp file with the road network.
+* a set of .shp files with the Transmilenio edges and stations.
+
+In addition, for realistic transit routing, optional inputs may be (to be used with the _r5r_ package):
+
+* a .pbf file with the road network. Format matters, OSM files can be downloaded here: [HotOSM](https://export.hotosm.org/)
+* a .zip archive with the SITP GTFS files. Format matters. GTFS must not contain _"frequencies.txt"_.
+
+All data source are open with projected CRS: WGS 84 / Zone 18 N (EPSG:32618) and converted if necessary.
+
+```{r}
+viajes <- read.xlsx("Data/ViajesEODH2019.xlsx")                                                      # Urban mobility survey (trip table)
+Transmi <- st_read(dsn = "Data", layer = "Transmilenio")                                             # Transmilenio network
+Transmi_stops <- st_read(dsn = "Data", layer = "estaciones-de-transmilenio")  # Transmilenio stops
+Routes <- st_read(dsn = "Data", layer = "Reseau_routier")                                            # Road network
+ZAT <- st_read(dsn = "Data", layer = "ZAT")                                                          # ZAT boundaries
+UTAM <- st_read(dsn = "Data", layer = "EMU2019_area")                                                # UTAM boundaries
+Manzana <- st_read(dsn = "Data", layer = "Manzana_Hogares")                                          # Household manzana
+contour <- st_read(dsn = "Data", layer = "contour")                                                  # edge of the city
+UTAM_urban <- st_read(dsn = "Data", layer = "UTAM_solo_mancha_urbana")                               # urban part of the UTAM
+ZAT_urban <- st_read(dsn = "Data", layer = "ZAT_solo_mancha_urbana")                                 # urban part of the ZAT
+```
+
+Data source:
+
+
+Dataset                     | Format| Date | Description
+--------------------------- | ----- | ---- | ------------
+EMU2019_area                | .shp  | 2019 | 132 UTAM
+ZAT                         | .shp  | 2019 | 998 ZAT
+ViajesEODH                  | .xlsx | 2019 | 135,000 trips
+Transmilenio                | .shp  | 2022 | Transmilenio network
+estaciones-de-transmilenio  | .shp  | 2022 | Transmilenio stations
+Reaseau_routier             | .shp  | 2022 | OSM road network for _sfnetworks_ and _dodgr_
+Bogota_large.osm            | .pbf  | 2023 | OSM road network for _r5r_
+GTFS                        | .zip  | 2023 | SITP timetables
+
+
+## Dataset appraisal
+
+```{r Some apraisal on the ZAT and UTAM databases}
+UTAM$area <- st_area(UTAM)
+ZAT$area <- st_area(ZAT)
+```
+
+```{r dataset apraisal}
+#Computing the trip duration and tackling with the trips starting one day and concluding the following.
+viajes$duracion <- viajes$p31_hora_llegada - viajes$hora_inicio_viaje
+
+viajes$duracion[viajes$duracion<0] <- viajes$duracion[viajes$duracion<0] + 1
+
+#Selecting the trips with strictly positive duration: 134497 --> 134444 remaining trips
+viajes <- viajes %>%  filter(duracion>0)
+
+#Excluding the trips entering or leaving the metropolitan area (DC + Soacha + close UTAM): 134444 --> 120655 remaining trips
+
+excl <- c("N/A", "UPR1", "UPR2", "UPR3", "UTAM117", "UTAM60", "UTAM63", "UTAM64")
+
+viajes$utam_destino[is.na(viajes$utam_destino)] <- "N/A"
+viajes$utam_origen[is.na(viajes$utam_origen)] <- "N/A"
+
+viajes <- viajes[which(!viajes$utam_origen %in% excl),]
+viajes <- viajes[which(!viajes$utam_destino %in% excl),]
+```
+
+# Counting active OD pairs in the trips database
+
+Computing the active UTAM pairs.
+
+```{r active UTAM pairs}
+active_UTAM <- viajes[,c(30,33:34)] %>% group_by(utam_origen, utam_destino) %>% summarise(n = n(), viajes = sum(f_exp))
+
+mat_active_UTAM <- as.matrix(xtabs(viajes~utam_origen+utam_destino, data=active_UTAM))
+
+ini <- rep(0, nrow(UTAM)*nrow(UTAM))
+UTAMCount <- matrix(ini, nrow = nrow(UTAM), dimnames = list(UTAM$UTAM, UTAM$UTAM))
+for(i in 1:nrow(UTAM)){
+  for(j in 1:nrow(UTAM)){
+    ori <- UTAM$UTAM[i]
+    dest <- UTAM$UTAM[j]
+    row <- match(ori, rownames(mat_active_UTAM))
+    col <- match(dest, colnames(mat_active_UTAM))
+    UTAMCount[i,j] <- mat_active_UTAM[row,col]
+  }
+}
+
+heatmap(UTAMCount, Colv = NA, Rowv = NA)
+```
+
+We see that the a given zone (UTAM) generates more internal trips than with any other one. But what interests us now is to see the benefits of first reducing the OD matrix to its "active" equivalent, i.e. with only the OD pairs with an effective trip. So we convert all strictly positive values to the boolean _TRUE_ and all zeros to _FALSE_ to visualize it more clearly. We have approx. 25% of zeros.
+
+```{r active UTAM pairs bool}
+UTAMBool <- UTAMCount
+UTAMBool[UTAMBool > 0] <- TRUE
+UTAMBool[UTAMBool == 0] <- FALSE
+
+UTAMBool2 <- as.data.frame(as.table(UTAMBool))
+colnames(UTAMBool2) <- c("utam_origen", "utam_destino", "viaje")
+
+
+ggplot(UTAMBool2, aes(utam_origen, utam_destino, fill= factor(viaje))) + 
+    geom_tile(lwd = 0,
+              linetype = 1)+
+    scale_fill_manual(values = c('red', 'green'), labels = c("No", "Sí"))+
+    theme(axis.text.x = element_text(angle = 90, size = 4))+
+    theme(axis.text.y = element_text(size = 4))+
+  labs(fill = "¿Viaje?")
+```
+
+Now what happens with ZATs? Note that some NA values appear because of ZAT that were not surveyed. Their absence will therefore not affect the distance computation on the trip database.
+
+```{r active ZAT pairs}
+active_ZAT <- viajes[,c(6:11,30)] %>% group_by(zat_origen, zat_destino) %>% summarise(n = n(),viajes = sum(f_exp))
+
+mat_active_ZAT <- as.matrix(xtabs(viajes~zat_origen+zat_destino, data=active_ZAT))
+
+ini <- rep(0, nrow(ZAT)*nrow(ZAT))
+ZATCount <- matrix(ini, nrow = nrow(ZAT), dimnames = list(ZAT$ZAT, ZAT$ZAT))
+for(i in 1:nrow(ZAT)){
+  for(j in 1:nrow(ZAT)){
+    ori <- ZAT$ZAT[i]
+    dest <- ZAT$ZAT[j]
+    row <- match(ori, rownames(mat_active_ZAT))
+    col <- match(dest, colnames(mat_active_ZAT))
+    ZATCount[i,j] <- mat_active_ZAT[row,col]
+  }
+}
+
+heatmap(ZATCount, Colv = NA, Rowv = NA)
+```
+
+We see their are far more zeros with the ZATs: 94%. The boolean matrix confirms:
+
+```{r active ZAT pairs bool}
+ZATBool <- ZATCount
+ZATBool[ZATBool > 0] <- TRUE
+ZATBool[ZATBool == 0] <- FALSE
+
+ZATBool2 <- as.data.frame(as.table(ZATBool))
+colnames(ZATBool2) <- c("zat_origen", "zat_destino", "viaje")
+
+
+ggplot(ZATBool2, aes(zat_origen, zat_destino, fill= factor(viaje))) + 
+    geom_tile(lwd = 0,
+              linetype = 1)+
+    scale_fill_manual(values = c('red', 'green'), labels = c("No", "Sí"))+
+    theme(axis.text.x = element_text(angle = 90, size = 4))+
+    theme(axis.text.y = element_text(size = 4))+
+  labs(fill = "¿Viaje?")
+```
+
+Therefore we have no interest in computing full distance matrix for ZATs. Instead, we should compute distances only on active OD pairs. 
+However, we evidenced that the algorithms we use to compute distances ( _sfnetworks_ or _dodgr_) are far quicker on huge matrix than on one-by-one computation, so we will still rely on huge matrix in the rest of this document.   
+
+# Sampling UTAM
+
+To check the effect of the surface area of the zones, i.e. to assess the interest of using ZATs instead of UTAMs, we do some sampling on the zones: we sample some points on each UTAM and replace the centroid-to-centroid distance by the distance between the sampled points. Finally we carry out basic statistics to see the global size effect of the zones.
+
+```{r sampled UTAM}
+#map box
+zoom_level <- 9.5
+lon_span <- 360 / 2^zoom_level
+lat_span <- 360 / 2^zoom_level
+
+zoom_to_Bogota <- c(-74.12, 4.72)  # Bogota
+lon_bounds_Bogota <- c(zoom_to_Bogota[1] - lon_span / 2, zoom_to_Bogota[1] + lon_span / 2)
+lat_bounds_Bogota <- c(zoom_to_Bogota[2] - lat_span / 2, zoom_to_Bogota[2] + lat_span / 2)
+
+
+#sample size (objective : 1000 od pairs so sqrt(1000) points in each zone)
+s <- 32
+d <- nrow(UTAM_urban)
+UTAMSampled <- st_sample(UTAM_urban, rep(s,d))
+
+UTAMSampled <- st_sf(UTAMSampled) %>%
+  st_join(UTAM[,2],
+          join = st_intersects)
+
+UTAMSampled$row <- rep(c(1:s),d)
+
+UTAM <- UTAM %>% st_transform(4326)
+UTAM_urban <- UTAM_urban %>% st_transform(4326)
+UTAMSampled <- UTAMSampled %>% st_transform(4326)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = UTAM, fill = "white")+
+  geom_sf(data = UTAMSampled, aes(col = factor(row)), size = 0.8)+
+  labs(title = paste0("Los UTAM y un muestreo de ", s,  " puntos en cada uno"), col = "Puesto") +
+  coord_sf(xlim = lon_bounds_Bogota, ylim = lat_bounds_Bogota, datum = NA)+
+  labs(x = "", y = "") +
+  theme(legend.position = "right",
+        legend.text = element_text(size=10))+
+  annotation_scale(location = "br", height = unit(0.12, "cm"),text_cex = 0.8) +
+  annotation_north_arrow(location = "tl", which_north = "true", height = unit(1, "cm"), width = unit(0.8, "cm"))
+
+
+```
+
+The following chunk shows a simple sampling test to explain and visualize the subsetting method applied to recover the distance matrix from a big matrix. All cases of the same colors belong to one single matrix. With a sampling of size s, we get s² distance matrix.
+
+```{r sampling explained}
+#chosing a sample size (e.g. 2)
+s = 2
+#chosing a number of zones (e.g. 4)
+d = 4
+
+#initializing a matrix of size (s*d)²
+mat <- matrix(c(1:(d*d*s*s)),s*d,s*d)
+
+#separating the big matrix into s² matrix of size d²
+for(u in 1:s){
+  for(v in 1:s){
+    subset_i = seq(from = u, to = s*d, by = s)
+    subset_j = seq(from = v, to = s*d, by = s)
+    mat[subset_i,subset_j] <- (u-1)*s+(v-1)
+    }
+ }
+
+mat2 <- as.data.frame(as.table(mat))
+
+#Displaying the result
+ggplot(mat2, aes(Var1, Var2, fill= factor(Freq))) + 
+    geom_tile(lwd = 0,
+              linetype = 1)+
+  labs(fill = "Matrix")
+```
+
+Computing the s² distance matrix.
+
+## Euclidean distance
+
+```{r sampled straight line}
+#computing the complete distance matrix from each sampled UTAM to each sampled UTAM (size (s*d)²).
+mat_straight <- as.data.frame(st_distance(x = UTAMSampled$geometry, y = UTAMSampled$geometry))
+rownames(mat_straight) <- paste0(UTAMSampled$UTAM, "_",UTAMSampled$row)
+colnames(mat_straight) <- paste0(UTAMSampled$UTAM, "_",UTAMSampled$row)
+```
+
+```{r eval = FALSE}
+#recovering s² matrix, each of size d², with all possible distances (optional, for demonstration purpose only)
+
+for(u in 1:s){
+  for(v in 1:s){
+    subset_i = seq(from = u, to = s*d, by = s)
+    subset_j = seq(from = v, to = s*d, by = s)
+    z <- mat[subset_i,subset_j]
+    colnames(z) <- UTAM_urban$UTAM
+    rownames(z) <- UTAM_urban$UTAM
+    assign(paste0("mat_", (u-1)*s+(v-1)),z)
+  }
+}
+```
+
+Join with the trip database.
+
+```{r sampled euclidean chart with foreach}
+doFuture::registerDoFuture()
+future::plan(multisession, workers = 12)
+options(future.globals.maxSize= 1048576000)
+viajes2 <- viajes[,c(1:3,30,33,34)]
+viajes2$id_unico <- 1:nrow(viajes2)
+
+s <- 32
+d <- nrow(UTAM_urban)
+
+comb <- function(z) {
+  merge(viajes2, z, by = c("utam_origen", "utam_destino")) %>% arrange(id_unico) %>%
+  select(c(-utam_origen, -utam_destino,-id_hogar, -id_persona, -id_viaje, -f_exp, -id_unico))
+}
+
+print(Sys.time())
+
+viajes3 <- foreach(u = 1:s, .combine = 'cbind') %:%
+  foreach(v = 1:s, .combine = 'cbind') %dofuture% {
+    subset_i = seq(from = u, to = s*d, by = s)
+    subset_j = seq(from = v, to = s*d, by = s)
+    z <- mat_straight[subset_i,subset_j]
+    colnames(z) <- UTAM_urban$UTAM
+    rownames(z) <- UTAM_urban$UTAM
+    z <- data.frame(rownames(as.matrix(z))[row(as.matrix(z))], 
+               colnames(as.matrix(z))[col(as.matrix(z))], 
+               c(as.matrix(z)))
+    colnames(z) <- c("utam_origen", "utam_destino", paste0("dist",(u-1)*s+(v-1)))
+    x <- comb(z)
+  }
+
+
+print(Sys.time())
+
+viajes2 <- cbind(viajes2, viajes3)
+
+#Computing the total distance (matrix product)
+dist_table <- as.matrix(viajes2[,8:(7+s^2)])
+dist <- as.data.frame(t(viajes2$f_exp %*% dist_table /1000))
+
+avg <- mean(dist$V1)
+sd(dist$V1)
+max(dist$V1)
+min(dist$V1)
+
+ggplot(data = dist, aes(x = V1))+
+  theme_bw()+
+  geom_histogram(binwidth = 1e+05, color = "white", fill = "red")+
+  geom_vline(aes(xintercept = avg, color = paste0("mean = ", round(avg/1e06, 1), " million")), linewidth = 1)+
+  scale_color_manual(name = "", values = "blue")+
+  labs(title = paste0("Histogram of distances between UTAM in straight line", "\n" ,"n = ", s), x = "Distance (people.km/day)")
+```
+
+The average total PKT following a straight line (Euclidian distance) is 107.3 million people.km.
+
+Exports (optional)
+```{r eval=FALSE}
+write.xlsx(viajes2, "ViajesEODH_straight_20.xlsx")
+write.xlsx(dist, "Dist_UTAM_straight_20.xlsx")
+```
+
+## Road network ( _dodgr_ )
+
+Some data appraisal and computing the big matrix (s*d)² for pedestrians, cyclists and motorized modes.
+```{r sampled road network}
+#Opening the road network
+Routes <- st_cast(Routes, "LINESTRING")
+Routes <- Routes %>% st_transform(4326)
+
+#Giving weights to the road network and keeping only the biggest connected component to reduce the number of NA.
+net_mot <- weight_streetnet(Routes, wt_profile = "motorcar", type_col = "type")
+net_mot <- net_mot[net_mot$component == 1,]
+
+#Computing the OD distance matrix for the motorized modes. It is very fast! (15 seconds for s = 5, 60 seconds for s = 20)
+
+mat_mot <- as.data.frame(dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(UTAMSampled)), to = as.data.frame(st_coordinates(UTAMSampled)), shortest = TRUE))
+rownames(mat_mot) <- paste0(UTAMSampled$UTAM, "_",UTAMSampled$row)
+colnames(mat_mot) <- paste0(UTAMSampled$UTAM, "_",UTAMSampled$row)
+
+#dealing with NA using the straight line distance when necessary
+mat_mot[is.na(mat_mot)] <- mat_straight[is.na(mat_mot)]
+```
+
+Recovering the s² distance matrix and merging with the trip table
+
+```{r sampled road network chart with foreach UTAM, eval = TRUE}
+doFuture::registerDoFuture()
+future::plan(multisession, workers = 12)
+options(future.globals.maxSize= 1048576000)
+viajes2 <- viajes[,c(1:3,30,33,34)]
+viajes2$id_unico <- 1:nrow(viajes2)
+
+comb <- function(z) {
+  merge(viajes2, z, by = c("utam_origen", "utam_destino")) %>% arrange(id_unico) %>%
+  select(c(-utam_origen, -utam_destino,-id_hogar, -id_persona, -id_viaje, -f_exp, -id_unico))
+}
+
+print(Sys.time())
+
+viajes3 <- foreach(u = 1:s, .combine = 'cbind') %:%
+  foreach(v = 1:s, .combine = 'cbind') %dofuture% {
+    subset_i = seq(from = u, to = s*d, by = s)
+    subset_j = seq(from = v, to = s*d, by = s)
+    z <- mat_mot[subset_i,subset_j]
+    colnames(z) <- UTAM_urban$UTAM
+    rownames(z) <- UTAM_urban$UTAM
+    z <- data.frame(rownames(as.matrix(z))[row(as.matrix(z))], 
+               colnames(as.matrix(z))[col(as.matrix(z))], 
+               c(as.matrix(z)))
+    colnames(z) <- c("utam_origen", "utam_destino", paste0("dist",(u-1)*s+(v-1)))
+    x <- comb(z)
+  }
+
+
+print(Sys.time())
+
+viajes2 <- cbind(viajes2, viajes3)
+
+#Computing the total distance (matrix product)
+dist_table <- as.matrix(viajes2[,8:(7+s^2)])
+dist <- as.data.frame(t(viajes2$f_exp %*% dist_table /1000))
+
+avg <- mean(dist$V1)
+sd <- sd(dist$V1)
+max(dist$V1)
+min(dist$V1)
+
+margin = qt(0.975,df=s^2-1)*sd/s
+
+upper_bound = avg + margin
+lower_bound = avg - margin
+
+
+ggplot(data = dist, aes(x = V1))+
+  theme_bw()+
+  geom_histogram(binwidth = 1e+05, color = "white", fill = "red")+
+  geom_vline(aes(xintercept = avg, color = paste0("mean = ", round(avg/1e06, 1), " million")), linewidth = 1)+
+  scale_color_manual(name = "", values = "blue")+
+  labs(title = paste0("Histogram of distances between UTAM by the road network", "\n" ,"n = ", s), x = "Total PKT")
+```
+
+```{r eval=FALSE}
+#export (optional)
+write.xlsx(dist, "Dist_UTAM_road_32.xlsx")
+
+```
+
+The average total PKT by the road network is now 134.2 million people.km. Using the road network gives an average increase in distance of 25%.
+
+```{r comparing the centroid to centroid distance with the above}
+UTAMCentroids <- st_centroid(UTAM_urban)
+mat_straight <- as.data.frame(st_distance(x = UTAMCentroids$geometry, y = UTAMCentroids$geometry))
+rownames(mat_straight) <- paste0(UTAMCentroids$UTAM)
+colnames(mat_straight) <- paste0(UTAMCentroids$UTAM)
+
+mat_mot_centroids <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(UTAMCentroids)), to = as.data.frame(st_coordinates(UTAMCentroids)), shortest = TRUE)
+rownames(mat_mot_centroids) <- UTAMCentroids$UTAM
+colnames(mat_mot_centroids) <- UTAMCentroids$UTAM
+mat_mot_centroids[is.na(mat_mot_centroids)] <- mat_straight[is.na(mat_mot_centroids)]
+mat_mot_centroids_table <- as.data.frame(as.table(mat_mot_centroids))
+colnames(mat_mot_centroids_table) <- c("utam_origen", "utam_destino", "distCentroids")
+
+viajes2 <- merge(viajes2, mat_mot_centroids_table, by = c("utam_origen", "utam_destino")) 
+```
+
+```{r Choosing a method for intrazone trips UTAM}
+viajes_intra <- viajes2[viajes2$utam_origen == viajes2$utam_destino,] #34390/120655 observations
+  
+dist_table <- as.matrix(viajes_intra[,8:(8+s^2)])
+dist <- as.data.frame(t(viajes_intra$f_exp %*% dist_table /1000)) %>% arrange(V1) 
+
+#indexes of the columns where internal distance is equal to zero:
+index_zero <- rep("VIDE",s)
+for(i in 1:s){
+    index_zero[i] <- paste0("dist",(i-1)*s+(i-1))
+}
+
+#First method for intra zone distance: the average distance of the trips in the non-zero cases.
+viajes_intra_non_zero <- viajes_intra[,!(colnames(viajes_intra) %in% index_zero)]
+viajes_intra$dist_mean_non_zeros <- rowMeans(viajes_intra_non_zero[,8:1000])
+
+viajes_intra_mean_non_zeros <- viajes_intra
+viajes_intra_mean_non_zeros[,(colnames(viajes_intra) %in% index_zero)] <- viajes_intra_mean_non_zeros$dist_mean_non_zeros
+viajes_intra_mean_non_zeros$distCentroids <- viajes_intra_mean_non_zeros$dist_mean_non_zeros
+
+#Second method: the CEREMA formula
+viajes_intra <- viajes_intra %>% 
+  left_join(UTAM[,c("UTAM","area")], by = c("utam_origen" = "UTAM")) 
+viajes_intra$geometry = NULL
+viajes_intra$dist_cerema <- 0.5*sqrt(viajes_intra$area)
+
+viajes_intra_cerema <- viajes_intra
+viajes_intra_cerema[,(colnames(viajes_intra) %in% index_zero)] <- viajes_intra_cerema$dist_cerema
+viajes_intra_cerema$distCentroids <- viajes_intra_cerema$dist_cerema
+
+#Comparison: CEREMA gives lower estimates
+plot(viajes_intra$dist_mean_non_zeros, viajes_intra$dist_cerema)
+reg <- lm(dist_mean_non_zeros ~ dist_cerema, data = viajes_intra)
+summary(reg) #Both are highly correlated and the regression is significant. Coeff for dist_cerema is 1.66
+
+#rebuilding the trip table with the zeros substituted by the means-non-zeros method
+viajes2_mean_non_zeros <- rbind(viajes2[viajes2$utam_origen != viajes2$utam_destino,], viajes_intra_mean_non_zeros[,1:1032])
+viajes2_mean_non_zeros$distAverageSample <- rowMeans(viajes2_mean_non_zeros[,8:1031])
+
+#rebuilding the trip table with the zeros substituted by the cerema method
+viajes2_cerema <- rbind(viajes2[viajes2$utam_origen != viajes2$utam_destino,], viajes_intra_cerema[,1:1032])
+viajes2_cerema$distAverageSample <- rowMeans(viajes2_cerema[,8:1031])
+
+#Student test
+t_mean_non_zeros_utam <- t.test(viajes2_mean_non_zeros$distAverageSample, viajes2_mean_non_zeros$distCentroids)
+t_cerema_utam <- t.test(viajes2_cerema$distAverageSample, viajes2_cerema$distCentroids)
+
+#in both cases the mean is different but p-value is higher for the mean_non_zero method
+
+#Computing the total distance (matrix product) for Method 1
+dist <- as.data.frame(t(viajes2_mean_non_zeros$f_exp %*% as.matrix(viajes2_mean_non_zeros[,8:(9+s^2)]) /1000))
+dist$sample <- rownames(dist)
+
+dist$highlight <- ifelse(dist$sample == "distCentroids", "yes", "no")
+
+avg <- mean(dist$V1)
+
+ggplot(data = dist, aes(x = V1))+
+  theme_bw()+
+  geom_histogram(binwidth = 1e+05, color = "white", aes(fill = highlight))+
+  geom_vline(aes(xintercept = avg, color = paste0("mean = ", round(avg/1e06, 1), " million")), linewidth = 1)+
+  scale_fill_manual(values = c("red", "green"), labels = c("sampled points", "centroids"))+
+  scale_color_manual(name = "", values = "blue")+
+  labs(title = paste0("Avg Intrazone dist as the average of non-zero intrazone dists", "\n" ,"n = ", s), x = "Total PKT", fill = "")
+
+#Computing the total distance (matrix product) for Method 2
+dist <- as.data.frame(t(viajes2_cerema$f_exp %*% as.matrix(viajes2_cerema[,8:(9+s^2)]) /1000))
+dist$sample <- rownames(dist)
+
+dist$highlight <- ifelse(dist$sample == "distCentroids", "yes", "no")
+
+avg <- mean(dist$V1)
+
+ggplot(data = dist, aes(x = V1))+
+  theme_bw()+
+  geom_histogram(binwidth = 1e+05, color = "white", aes(fill = highlight))+
+  geom_vline(aes(xintercept = avg, color = paste0("mean = ", round(avg/1e06, 1), " million")), linewidth = 1)+
+  scale_fill_manual(values = c("red", "green"), labels = c("sampled points", "centroids"))+
+  scale_color_manual(name = "", values = "blue")+
+  labs(title = paste0("Avg Intrazone dist using the Cerema formula", "\n" ,"n = ", s), x = "Total PKT", fill = "")
+
+```
+```{r saving for UTAM}
+viajes2_export <- viajes2_cerema
+viajes2_export$distCentroids_correct_mean_non_zeros <- viajes2_mean_non_zeros$distCentroids
+viajes2_export$distCentroids_correct_cerema <- viajes2_cerema$distCentroids
+viajes2_export$distAverage_correct_mean_non_zeros <- viajes2_mean_non_zeros$distAverageSample
+viajes2_export$distAverage_correct_cerema <- viajes2_cerema$distAverageSample
+viajes2_export$distCentroids = NULL
+viajes2_export$distAverageSample = NULL
+
+write.csv(viajes2_export, file = "Viajes_EODH_Dist_UTAM_32.csv")
+```
+
+
+# Sampling ZAT
+
+Now let's do this for the ZAT. The sample can be smaller and we must take into account longer computation times.
+
+```{r sampled ZAT}
+#sample size
+s <- 10
+d <- nrow(ZAT_urban)
+
+ZAT_urban <- ZAT_urban %>% st_transform(4326)
+ZAT <- ZAT %>% st_transform(4326)
+
+#Takes ~ 4.30 minutes for s = 10.
+ZATSampled <- st_sample(ZAT_urban, rep(s,d))
+
+ZATSampled <- st_sf(ZATSampled) %>%
+  st_join(ZAT[,8],
+          join = st_intersects)
+
+ZATSampled$row <- rep(c(1:s),d)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = ZAT, fill = "white")+
+  geom_sf(data = ZATSampled, aes(col = factor(row)), size = 0.8)+
+  labs(title = paste0("Las ZAT y un muestreo de ", s,  " puntos en cada una"), col = "Puesto") +
+  coord_sf(xlim = lon_bounds_Bogota, ylim = lat_bounds_Bogota, datum = NA)+
+  labs(x = "", y = "") +
+  theme(legend.position = "right",
+        legend.text = element_text(size=10))+
+  annotation_scale(location = "br", height = unit(0.12, "cm"),text_cex = 0.8) +
+  annotation_north_arrow(location = "tl", which_north = "true", height = unit(1, "cm"), width = unit(0.8, "cm"))
+
+```
+
+## Euclidean distance
+
+```{r sampled straight line 2}
+#computing the complete distance matrix from each sampled UTAM to each sampled UTAM (size (s*d)²).
+mat <- as.data.frame(st_distance(x = ZATSampled$geometry, y = ZATSampled$geometry))
+rownames(mat) <- paste0(ZATSampled$ZAT, "_",ZATSampled$row)
+colnames(mat) <- paste0(ZATSampled$ZAT, "_",ZATSampled$row)
+```
+
+## Road network
+
+```{r sampled road network 2}
+#Computing the OD distance matrix for the motorized modes. It is very fast! (50 seconds for s = 3, 4 min for s = 10)
+mat_mot <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(ZATSampled)), to = as.data.frame(st_coordinates(ZATSampled)), shortest = TRUE)
+
+rownames(mat_mot) <- ZATSampled$ZAT
+colnames(mat_mot) <- ZATSampled$ZAT
+
+#dealing with NA using the straight line distance when necessary
+mat_mot[is.na(mat_mot)] <- mat[is.na(mat_mot)]
+```
+
+Join with the trips database
+
+```{r with foreach ZAT}
+doFuture::registerDoFuture()
+future::plan(multisession, workers = 12)
+options(future.globals.maxSize= 1048576000)
+viajes2 <- viajes[viajes$zat_origen %in% ZAT_urban$ZAT & viajes$zat_destino %in% ZAT_urban$ZAT,c(1:3,30,6,11)]
+viajes2$id_unico <- 1:nrow(viajes2)
+
+comb <- function(z) {
+  merge(viajes2, z, by = c("zat_origen", "zat_destino")) %>% 
+    arrange(id_unico) %>%
+    select(c(-zat_origen, -zat_destino,-id_hogar, -id_persona, -id_viaje, -f_exp, -id_unico))
+}
+
+print(Sys.time())
+
+viajes3 <- foreach(u = 1:s, .combine = 'cbind') %:%
+  foreach(v = 1:s, .combine = 'cbind') %dofuture% {
+    subset_i = seq(from = u, to = s*d, by = s)
+    subset_j = seq(from = v, to = s*d, by = s)
+    z <- mat_mot[subset_i,subset_j]
+    colnames(z) <- ZAT_urban$ZAT
+    rownames(z) <- ZAT_urban$ZAT
+    z <- data.frame(rownames(as.matrix(z))[row(as.matrix(z))], 
+               colnames(as.matrix(z))[col(as.matrix(z))], 
+               c(as.matrix(z)))
+    colnames(z) <- c("zat_origen", "zat_destino", paste0("dist",(u-1)*s+(v-1)))
+    x <- comb(z)
+  }
+
+
+print(Sys.time())
+
+viajes2 <- cbind(viajes2, viajes3)
+
+#Computing the total distance (matrix product)
+dist_table <- as.matrix(viajes2[,8:(7+s^2)])
+dist <- as.data.frame(t(viajes2$f_exp %*% dist_table /1000))
+
+avg <- mean(dist$V1)
+sd <- sd(dist$V1)
+max(dist$V1)
+min(dist$V1)
+
+margin = qt(0.975,df=s^2-1)*sd/s
+
+upper_bound = avg + margin
+lower_bound = avg - margin
+
+
+ggplot(data = dist, aes(x = V1))+
+  theme_bw()+
+  geom_histogram(binwidth = 1e+05, color = "white", fill = "red")+
+  geom_vline(aes(xintercept = avg, color = paste0("mean = ", round(avg/1e06, 1), " million")), linewidth = 1)+
+  scale_color_manual(name = "", values = "blue")+
+  labs(title = paste0("Histogram of distances between ZAT by the road network", "\n" ,"n = ", s), x = "Total PKT")
+```
+```{r eval=FALSE}
+#export (optional)
+write.xlsx(dist, "Dist_ZAT_road_10.xlsx")
+
+```
+
+With a 10-sampling, average total PKT reaches 123.3 million people.km.
+
+```{r comparing the centroid to centroid distance with the above 2}
+ZATCentroids <- st_centroid(ZAT_urban)
+mat_straight <- as.data.frame(st_distance(x = ZATCentroids$geometry, y = ZATCentroids$geometry))
+rownames(mat_straight) <- paste0(ZATCentroids$ZAT)
+colnames(mat_straight) <- paste0(ZATCentroids$ZAT)
+
+mat_mot_centroids <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_mot_centroids) <- ZATCentroids$ZAT
+colnames(mat_mot_centroids) <- ZATCentroids$ZAT
+mat_mot_centroids[is.na(mat_mot_centroids)] <- mat_straight[is.na(mat_mot_centroids)]
+mat_mot_centroids_table <- as.data.frame(as.table(mat_mot_centroids))
+colnames(mat_mot_centroids_table) <- c("zat_origen", "zat_destino", "distCentroids")
+
+viajes2 <- merge(viajes2, mat_mot_centroids_table, by = c("zat_origen", "zat_destino")) 
+```
+
+Discussion: 
+
+* do outliers have to be removed of not?
+* does the centroid-based approach tend to underestimate the distance, or conversely does the sample-based approach tend to overestimate it?
+
+```{r Choosing a method for intrazone trips ZAT}
+viajes_intra <- viajes2[viajes2$zat_origen == viajes2$zat_destino,] #17290/120655 observations
+  
+dist_table <- as.matrix(viajes_intra[,8:(8+s^2)])
+dist <- as.data.frame(t(viajes_intra$f_exp %*% dist_table /1000)) %>% arrange(V1) 
+
+#indexes of the columns where internal distance is equal to zero:
+index_zero <- rep("VIDE",s)
+for(i in 1:s){
+    index_zero[i] <- paste0("dist",(i-1)*s+(i-1))
+}
+
+#First method for intra zone distance: the average distance of the trips in the non-zero cases.
+viajes_intra_non_zero <- viajes_intra[,!(colnames(viajes_intra) %in% index_zero)]
+viajes_intra$dist_mean_non_zeros <- rowMeans(viajes_intra_non_zero[,8:97])
+
+viajes_intra_mean_non_zeros <- viajes_intra
+viajes_intra_mean_non_zeros[,(colnames(viajes_intra) %in% index_zero)] <- viajes_intra_mean_non_zeros$dist_mean_non_zeros
+viajes_intra_mean_non_zeros$distCentroids <- viajes_intra_mean_non_zeros$dist_mean_non_zeros
+
+#Second method: the CEREMA formula
+viajes_intra <- viajes_intra %>% 
+  left_join(ZAT[,c("ZAT","area")], by = c("zat_origen" = "ZAT")) 
+viajes_intra$geometry = NULL
+viajes_intra$dist_cerema <- 0.5*sqrt(viajes_intra$area)
+
+viajes_intra_cerema <- viajes_intra
+viajes_intra_cerema[,(colnames(viajes_intra) %in% index_zero)] <- viajes_intra_cerema$dist_cerema
+viajes_intra_cerema$distCentroids <- viajes_intra_cerema$dist_cerema
+
+#Comparison: CEREMA gives lower estimates
+plot(viajes_intra$dist_mean_non_zeros, viajes_intra$dist_cerema)
+reg <- lm(dist_mean_non_zeros ~ dist_cerema, data = viajes_intra)
+summary(reg) #Both are highly correlated and the regression is significant. Coeff for dist_cerema is now 1.4
+
+#rebuilding the trip table with the zeros substituted by the means-non-zeros method
+viajes2_mean_non_zeros <- rbind(viajes2[viajes2$zat_origen != viajes2$zat_destino,], viajes_intra_mean_non_zeros[,1:108])
+viajes2_mean_non_zeros$distAverageSample <- rowMeans(viajes2_mean_non_zeros[,8:107])
+
+#rebuilding the trip table with the zeros substituted by the cerema method
+viajes2_cerema <- rbind(viajes2[viajes2$zat_origen != viajes2$zat_destino,], viajes_intra_cerema[,1:108])
+viajes2_cerema$distAverageSample <- rowMeans(viajes2_cerema[,8:107])
+
+#Student test
+t_mean_non_zeros_zat <- t.test(viajes2_mean_non_zeros$distAverageSample, viajes2_mean_non_zeros$distCentroids)
+t_cerema_zat <- t.test(viajes2_cerema$distAverageSample, viajes2_cerema$distCentroids)
+
+t_mean_non_zeros_zat
+t_cerema_zat
+
+#in both cases the mean is not statistically different and p-value is higher for the mean_non_zero method --> Centroids are a good approx. if we correct distance for intrazone trips.
+
+#Computing the total distance (matrix product) for Method 1
+dist <- as.data.frame(t(viajes2_mean_non_zeros$f_exp %*% as.matrix(viajes2_mean_non_zeros[,8:(9+s^2)]) /1000))
+dist$sample <- rownames(dist)
+
+dist$highlight <- ifelse(dist$sample == "distCentroids", "yes", "no")
+
+avg <- mean(dist$V1)
+
+ggplot(data = dist, aes(x = V1))+
+  theme_bw()+
+  geom_histogram(binwidth = 1e+05, color = "white", aes(fill = highlight))+
+  geom_vline(aes(xintercept = avg, color = paste0("mean = ", round(avg/1e06, 1), " million")), linewidth = 1)+
+  scale_fill_manual(values = c("red", "green"), labels = c("sampled points", "centroids"))+
+  scale_color_manual(name = "", values = "blue")+
+  labs(title = paste0("Avg Intrazone dist as the average of non-zero intrazone dists", "\n" ,"n = ", s), x = "Total PKT", fill = "")
+
+#Computing the total distance (matrix product) for Method 2
+dist <- as.data.frame(t(viajes2_cerema$f_exp %*% as.matrix(viajes2_cerema[,8:(9+s^2)]) /1000))
+dist$sample <- rownames(dist)
+
+dist$highlight <- ifelse(dist$sample == "distCentroids", "yes", "no")
+
+avg <- mean(dist$V1)
+
+ggplot(data = dist, aes(x = V1))+
+  theme_bw()+
+  geom_histogram(binwidth = 1e+05, color = "white", aes(fill = highlight))+
+  geom_vline(aes(xintercept = avg, color = paste0("mean = ", round(avg/1e06, 1), " million")), linewidth = 1)+
+  scale_fill_manual(values = c("red", "green"), labels = c("sampled points", "centroids"))+
+  scale_color_manual(name = "", values = "blue")+
+  labs(title = paste0("Avg Intrazone dist using the Cerema formula", "\n" ,"n = ", s), x = "Total PKT", fill = "")
+
+```
+```{r saving for ZAT}
+viajes2_export <- viajes2_cerema
+viajes2_export$distCentroids_correct_mean_non_zeros <- viajes2_mean_non_zeros$distCentroids
+viajes2_export$distCentroids_correct_cerema <- viajes2_cerema$distCentroids
+viajes2_export$distAverage_correct_mean_non_zeros <- viajes2_mean_non_zeros$distAverageSample
+viajes2_export$distAverage_correct_cerema <- viajes2_cerema$distAverageSample
+viajes2_export$distCentroids = NULL
+viajes2_export$distAverageSample = NULL
+
+#write.csv(viajes2_export, file = "Viajes_EODH_Dist_ZAT_10.csv")
+```
+
+# Distance computation on the trip database
+
+## Network apraisal
+
+We use _sfnetworks_ for Transmilenio, _dodgr_ for the road network and _r5r_ for the SITP.
+
+### Transmilenio
+
+```{r Transmilenio}
+Transmi <- st_cast(Transmi, "LINESTRING")
+
+#Building the network
+net_transmi = as_sfnetwork(Transmi, directed = FALSE) %>%
+  st_transform(4326) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length())
+
+#Subdividing edges
+net_transmi = convert(net_transmi, to_spatial_subdivision)
+
+#Including (blend) the stations to the network
+net_transmi = st_network_blend(net_transmi, Transmi_stops)
+
+#Computing the new length of each edge (necessary to avoid brain-teasing inconsistent distances at the following step...)
+net_transmi <- net_transmi %>% activate("edges") %>% mutate(weight = edge_length())
+```
+
+### Road network
+
+```{r weighting profile for sfnetworks, eval=FALSE}
+
+#Motorized weighting profile
+weighting_profile_mot = c(
+  residential = 10,
+  tertiary = 5,
+  footway = Inf,
+  track = Inf,
+  secondary = 2,
+  primary = 1,
+  service = 10,
+  unclassified = 5,
+  trunk = 1,
+  path = Inf,
+  cycleway = Inf,
+  pedestrian = Inf,
+  primary_link = 1,
+  bridleway = Inf,
+  steps = Inf,
+  secondary_link = 2,
+  trunk_link = 1,
+  road = 1,
+  platform = Inf,
+  living_street = 10,
+  tertiary_link = 5,
+  construction = Inf,
+  raceway = Inf,
+  turning_circle = 1,
+  bus_stop = Inf,
+  proposed = Inf,
+  unknown = Inf,
+  yes = Inf
+)
+
+#Cycling weighting profile
+weighting_profile_cycl = c(
+  residential = 2,
+  tertiary = 5,
+  footway = Inf,
+  track = 1,
+  secondary = 5,
+  primary = 10,
+  service = 2,
+  unclassified = 5,
+  trunk = 10,
+  path = 1,
+  cycleway = 1,
+  pedestrian = Inf,
+  primary_link = 10,
+  bridleway = 1,
+  steps = 1,
+  secondary_link = 5,
+  trunk_link = 10,
+  road = 10,
+  platform = Inf,
+  living_street = 2,
+  tertiary_link = 5,
+  construction = Inf,
+  raceway = Inf,
+  turning_circle = 10,
+  bus_stop = Inf,
+  proposed = Inf,
+  unknown = Inf,
+  yes = Inf
+)
+
+#Walking weighting profile
+weighting_profile_walk = c(
+  residential = 2,
+  tertiary = 5,
+  footway = 1,
+  track = 1,
+  secondary = 5,
+  primary = 10,
+  service = 2,
+  unclassified = 5,
+  trunk = 10,
+  path = 1,
+  cycleway = 2,
+  pedestrian = 1,
+  primary_link = 10,
+  bridleway = 1,
+  steps = 1,
+  secondary_link = 5,
+  trunk_link = 10,
+  road = 10,
+  platform = Inf,
+  living_street = 2,
+  tertiary_link = 5,
+  construction = Inf,
+  raceway = Inf,
+  turning_circle = 10,
+  bus_stop = Inf,
+  proposed = Inf,
+  unknown = Inf,
+  yes = Inf
+)
+
+weights <- data.frame(mot = weighting_profile_mot, cycl = weighting_profile_cycl, walk = weighting_profile_walk)
+weights$type <- rownames(weights)
+```
+
+```{r ROUTES VIA SFNETWORKS, eval=FALSE}
+Routes <- st_cast(Routes, "LINESTRING")
+
+#Building the network
+net_road = as_sfnetwork(Routes, directed = FALSE) %>%
+  st_transform(32618) %>%
+  activate("edges") %>%
+  mutate(weight = edge_length())
+
+#Using the biggest component
+net_road = net_road %>%
+  activate("nodes") %>%
+  filter(group_components() == 1)
+
+#Weighting the network
+net_road = net_road %>%
+  activate("edges") %>%
+  mutate(multiplier_mot = weighting_profile_mot[type]) %>%
+  mutate(multiplier_cycl = weighting_profile_cycl[type]) %>%
+  mutate(multiplier_walk = weighting_profile_walk[type]) %>%
+  mutate(weight_mot = edge_length() * multiplier_mot) %>%
+  mutate(weight_cycl = edge_length() * multiplier_cycl) %>%
+  mutate(weight_walk = edge_length() * multiplier_walk)
+```
+
+The problem with _sfnetworks_ is that it is too long a task to compute one-by-one distance on dual-weighted graphs. So let's try with another package, _cppRouting_, which deals well with dual-weighted graphs.
+
+```{r ROUTES VIA CPPROUTING, eval=FALSE}
+Routes <- Routes %>% left_join(weights, by = c("type" = "type"))
+Routes$length <- as.vector(st_length(Routes))
+Routes$weights_mot <- Routes$length*Routes$mot
+Routes$weights_cycl <- Routes$length*Routes$cycl
+Routes$weights_walk <- Routes$length*Routes$walk
+
+
+#Building the network
+vertices <- st_cast(Routes, "POINT") %>% group_by(geometry) %>% mutate(id=cur_group_id())
+vertices <- vertices[1:247968,]
+verticesfrom <- vertices[!duplicated(vertices$OBJECTID), ]
+vertices <- vertices[order(vertices$id, decreasing = TRUE),]
+verticesto <- vertices[!duplicated(vertices$OBJECTID), ]
+verticesto <- verticesto[order(verticesto$id),]
+
+routes <- st_drop_geometry(verticesfrom[c(2,16:19,21)]) %>% 
+  rename("from" = "id") %>%
+  left_join(st_drop_geometry(verticesto[c(2,21)]), by = "OBJECTID") %>%
+  rename("to" = "id")
+  
+
+coord <- rbind(verticesfrom, verticesto)
+st_write(coord[,21], "Routes_nodes.csv", layer_options = "GEOMETRY=AS_XY")
+coord <- fread(file.path(getwd(), "Routes_nodes.csv"), fill = TRUE) 
+coord$V4 = NULL
+coord <- coord[,c(3,1,2)] %>% rename("node_ID" = "id")
+coord <- coord[!duplicated(coord$node_ID),]
+
+graph_mot  <-  makegraph(routes[,c(6,7,3)], directed = FALSE, coords = coord, aux = routes$length)
+graph_mot <- cpp_contract(graph_mot)
+
+get_path_pair(graph_mot, 1, 3)
+get_distance_pair(graph_mot, 14399, 7788, aggregate_aux = TRUE)
+
+```
+
+There remain many issues with this package that make it non-suitable:
+
+
+* We need to first keep the biggest connected component of the graph. 
+* Unlike all other packages, it does not accept start and end points that are not nodes of the network. 
+
+Instead, we must snap foreign points to the network. We unsuccessfully tried it with _st_snap_ but the results were disappointing: each points was snapped to a very remote node instead of the nearest one.
+
+_dodgr_ remains the best option for quick many-to-many routing on dual-weighted networks, even for big matrix: 30 seconds approx. to compute matrix with 20 million cases!
+
+```{r ROUTES VIA DODGR}
+#Opening the road network (not necessary if already done before)
+#Routes <- st_cast(Routes, "LINESTRING")
+#Routes <- Routes %>% st_transform(4326)
+
+#Giving weights to the road network and keeping the biggest connected component (already done before for the motorized weighting). 
+#net_mot <- weight_streetnet(Routes, wt_profile = "motorcar", type_col = "type")
+#net_mot <- net_mot[net_mot$component == 1,]
+net_cycl <- weight_streetnet(Routes, wt_profile = "bicycle", type_col = "type")
+net_cycl <- net_cycl[net_cycl$component == 1,]
+net_walk <- weight_streetnet(Routes, wt_profile = "foot", type_col = "type")
+net_walk <- net_walk[net_walk$component == 1,]
+```
+
+
+## Distance computation
+
+We will compute the distance of each trip following the 5 main modes.
+Transmilenio uses _sf_networks_, road uses _dodgr_, the SITP requires _r5r_.
+To make it quicker, instead of a "if" loop, we subset the trip table into 4 tables according to the values of "lugar_origen" and "p28_lugar_destino": 
+
+
+* trips from home to home (1->1).
+* trips from home to another place (1->2).
+* trips from another place to home (2->1).
+* trips that do not include home (2->2).
+
+
+```{r Computing distance matrix using ZAT centroids and households manzanas}
+ZAT <- ZAT %>% st_transform(4326)
+Manzana <- Manzana %>% st_transform(4326)
+
+ZATCentroids <- st_centroid(ZAT)
+
+#Creating matrix with distances in straight lines. They will also be used to substitute NA values in the following  matrix (60 secs)
+mat_straight_12 <- as.data.frame(st_distance(x = st_geometry(Manzana), y = st_geometry(ZATCentroids)))
+rownames(mat_straight_12) <- Manzana$ID_HOGAR
+colnames(mat_straight_12) <- ZAT$ZAT
+mat_straight_12_table <- as.data.frame(as.table(as.matrix(mat_straight_12)))
+colnames(mat_straight_12_table) <- c("id_hogar", "zat_destino", "dist_straight")
+
+#120 secs
+mat_straight_21 <- as.data.frame(st_distance(x = st_geometry(ZATCentroids), y = st_geometry(Manzana)))
+rownames(mat_straight_21) <- ZAT$ZAT
+colnames(mat_straight_21) <- Manzana$ID_HOGAR
+mat_straight_21_table <- as.data.frame(as.table(as.matrix(mat_straight_21)))
+colnames(mat_straight_21_table) <- c("zat_origen", "id_hogar", "dist_straight")
+
+#2 secs
+mat_straight_22 <- as.data.frame(st_distance(x = st_geometry(ZATCentroids), y = st_geometry(ZATCentroids)))
+rownames(mat_straight_22) <- ZAT$ZAT
+colnames(mat_straight_22) <- ZAT$ZAT
+mat_straight_22_table <- as.data.frame(as.table(as.matrix(mat_straight_22)))
+colnames(mat_straight_22_table) <- c("zat_origen", "zat_destino", "dist_straight")
+
+#TRANSMILENIO
+# 1 --> 2 (Hogar --> ZAT) (4 secs)
+mat_transmi_12 <- st_network_cost(net_transmi, from = st_geometry(Manzana), to = st_geometry(ZATCentroids))
+rownames(mat_transmi_12) <- Manzana$ID_HOGAR
+colnames(mat_transmi_12) <- ZAT$ZAT
+mat_transmi_12_table <- as.data.frame(as.table(mat_transmi_12))
+colnames(mat_transmi_12_table) <- c("id_hogar", "zat_destino", "dist_transmi")
+
+# 2 --> 1 (ZAT --> Hogar) (4 secs)
+mat_transmi_21 <- st_network_cost(net_transmi, from = st_geometry(ZATCentroids), to = st_geometry(Manzana))
+rownames(mat_transmi_21) <- ZAT$ZAT
+colnames(mat_transmi_21) <- Manzana$ID_HOGAR
+mat_transmi_21_table <- as.data.frame(as.table(mat_transmi_21))
+colnames(mat_transmi_21_table) <- c("zat_origen", "id_hogar", "dist_transmi")
+
+# 2 --> 2 (ZAT --> ZAT) (1 sec)
+mat_transmi_22 <- st_network_cost(net_transmi, from = st_geometry(ZATCentroids), to = st_geometry(ZATCentroids))
+rownames(mat_transmi_22) <- ZAT$ZAT
+colnames(mat_transmi_22) <- ZAT$ZAT
+mat_transmi_22_table <- as.data.frame(as.table(mat_transmi_22))
+colnames(mat_transmi_22_table) <- c("zat_origen", "zat_destino", "dist_transmi")
+
+#MOTORIZADO
+# 1 --> 2 (Hogar --> ZAT) (20 secs)
+#Some Manzanas are snapped to the same node in the road network, so for a given ZAT we get only 11478 distinct distances instead of nrow(Manzana) = 21828.
+mat_mot_12 <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(Manzana)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_mot_12) <- Manzana$ID_HOGAR
+colnames(mat_mot_12) <- ZAT$ZAT
+mat_mot_12[is.na(mat_mot_12)] <- mat_straight_12[is.na(mat_mot_12)]
+mat_mot_12_table <- as.data.frame(as.table(mat_mot_12))
+colnames(mat_mot_12_table) <- c("id_hogar", "zat_destino", "dist_car")
+
+# 2 --> 1 (ZAT --> Hogar) (20 secs)
+mat_mot_21 <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(Manzana)), shortest = TRUE)
+rownames(mat_mot_21) <- ZAT$ZAT
+colnames(mat_mot_21) <- Manzana$ID_HOGAR
+mat_mot_21[is.na(mat_mot_21)] <- mat_straight_21[is.na(mat_mot_21)]
+mat_mot_21_table <- as.data.frame(as.table(mat_mot_21))
+colnames(mat_mot_21_table) <- c("zat_origen", "id_hogar", "dist_car")
+
+# 2 --> 2 (ZAT --> ZAT) (10 secs)
+mat_mot_22 <- dodgr_dists(graph = net_mot, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_mot_22) <- ZAT$ZAT
+colnames(mat_mot_22) <- ZAT$ZAT
+mat_mot_22[is.na(mat_mot_22)] <- mat_straight_22[is.na(mat_mot_22)]
+mat_mot_22_table <- as.data.frame(as.table(mat_mot_22))
+colnames(mat_mot_22_table) <- c("zat_origen", "zat_destino", "dist_car")
+
+#BICI
+# 1 --> 2 (Hogar --> ZAT) (20 secs)
+mat_cycl_12 <- dodgr_dists(graph = net_cycl, from = as.data.frame(st_coordinates(Manzana)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_cycl_12) <- Manzana$ID_HOGAR
+colnames(mat_cycl_12) <- ZAT$ZAT
+mat_cycl_12[is.na(mat_cycl_12)] <- mat_straight_12[is.na(mat_cycl_12)]
+mat_cycl_12_table <- as.data.frame(as.table(mat_cycl_12))
+colnames(mat_cycl_12_table) <- c("id_hogar", "zat_destino", "dist_bike")
+
+# 2 --> 1 (ZAT --> Hogar) (20 secs)
+mat_cycl_21 <- dodgr_dists(graph = net_cycl, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(Manzana)), shortest = TRUE)
+rownames(mat_cycl_21) <- ZAT$ZAT
+colnames(mat_cycl_21) <- Manzana$ID_HOGAR
+mat_cycl_21[is.na(mat_cycl_21)] <- mat_straight_21[is.na(mat_cycl_21)]
+mat_cycl_21_table <- as.data.frame(as.table(mat_cycl_21))
+colnames(mat_cycl_21_table) <- c("zat_origen", "id_hogar", "dist_bike")
+
+# 2 --> 2 (ZAT --> ZAT) (10 secs)
+mat_cycl_22 <- dodgr_dists(graph = net_cycl, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_cycl_22) <- ZAT$ZAT
+colnames(mat_cycl_22) <- ZAT$ZAT
+mat_cycl_22[is.na(mat_cycl_22)] <- mat_straight_22[is.na(mat_cycl_22)]
+mat_cycl_22_table <- as.data.frame(as.table(mat_cycl_22))
+colnames(mat_cycl_22_table) <- c("zat_origen", "zat_destino", "dist_bike")
+
+#WALK
+# 1 --> 2 (Hogar --> ZAT) (20 secs)
+mat_walk_12 <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(Manzana)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_walk_12) <- Manzana$ID_HOGAR
+colnames(mat_walk_12) <- ZAT$ZAT
+mat_walk_12[is.na(mat_walk_12)] <- mat_straight_12[is.na(mat_walk_12)]
+mat_walk_12_table <- as.data.frame(as.table(mat_walk_12))
+colnames(mat_walk_12_table) <- c("id_hogar", "zat_destino", "dist_walk")
+
+# 2 --> 1 (ZAT --> Hogar) (20 secs)
+mat_walk_21 <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(Manzana)), shortest = TRUE)
+rownames(mat_walk_21) <- ZAT$ZAT
+colnames(mat_walk_21) <- Manzana$ID_HOGAR
+mat_walk_21[is.na(mat_walk_21)] <- mat_straight_21[is.na(mat_walk_21)]
+mat_walk_21_table <- as.data.frame(as.table(mat_walk_21))
+colnames(mat_walk_21_table) <- c("zat_origen", "id_hogar", "dist_walk")
+
+# 2 --> 2 (ZAT --> ZAT) (10 secs)
+mat_walk_22 <- dodgr_dists(graph = net_walk, from = as.data.frame(st_coordinates(ZATCentroids)), to = as.data.frame(st_coordinates(ZATCentroids)), shortest = TRUE)
+rownames(mat_walk_22) <- ZAT$ZAT
+colnames(mat_walk_22) <- ZAT$ZAT
+mat_walk_22[is.na(mat_walk_22)] <- mat_straight_22[is.na(mat_walk_22)]
+mat_walk_22_table <- as.data.frame(as.table(mat_walk_22))
+colnames(mat_walk_22_table) <- c("zat_origen", "zat_destino", "dist_walk")
+```
+
+Now we can fill the trip database
+
+```{r Filling the trip database (all but SITP), eval = FALSE}
+viajes_dist <- viajes[,c(1:3,5,6,7,10,11,30,35,37)]
+
+#This variable will be computed with r5r
+
+viajes_dist$dist_sitp <- 0
+
+#Dividing the trip table into 4 sub-tables according to lugar_origen and lugar_destino
+
+viajes_dist_11 <- viajes_dist %>% filter(lugar_origen == 1 & p28_lugar_destino == 1)
+viajes_dist_12 <- viajes_dist %>% filter(lugar_origen == 1 & p28_lugar_destino == 2)
+viajes_dist_21 <- viajes_dist %>% filter(lugar_origen == 2 & p28_lugar_destino == 1)
+viajes_dist_22 <- viajes_dist %>% filter(lugar_origen == 2 & p28_lugar_destino == 2)
+
+#The Hogar -> Hogar table has all its distances equal to zero
+viajes_dist_11$dist_car <- 0
+viajes_dist_11$dist_bike <- 0
+viajes_dist_11$dist_walk <- 0
+viajes_dist_11$dist_transmi <- 0
+viajes_dist_11$dist_straight <- 0
+
+#For the other trip tables, computing the car, bike and walk matrix distances was already done with dodgr. We just have to do a multiple-column join. Note that the merge step removes ZAT that are not in the official ZAT tables (e.g. 257 rows with ZAT = 0, etc). 2296 rows are removed. It takes 30 sec for 12 and 21 tables, 1 sec for 22 tables which have fewer rows and zone index.
+
+viajes_dist_12 <- merge(viajes_dist_12, mat_mot_12_table, by = c("id_hogar", "zat_destino")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_mot_21_table, by = c("id_hogar", "zat_origen")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_mot_22_table, by = c("zat_origen", "zat_destino")) 
+
+viajes_dist_12 <- merge(viajes_dist_12, mat_cycl_12_table, by = c("id_hogar", "zat_destino")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_cycl_21_table, by = c("id_hogar", "zat_origen")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_cycl_22_table, by = c("zat_origen", "zat_destino")) 
+
+viajes_dist_12 <- merge(viajes_dist_12, mat_walk_12_table, by = c("id_hogar", "zat_destino")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_walk_21_table, by = c("id_hogar", "zat_origen")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_walk_22_table, by = c("zat_origen", "zat_destino")) 
+
+#The same for Transmilenio (sfnetworks)
+viajes_dist_12 <- merge(viajes_dist_12, mat_transmi_12_table, by = c("id_hogar", "zat_destino")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_transmi_21_table, by = c("id_hogar", "zat_origen")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_transmi_22_table, by = c("zat_origen", "zat_destino")) 
+
+#The same for the straight line (st_distances)
+viajes_dist_12 <- merge(viajes_dist_12, mat_straight_12_table, by = c("id_hogar", "zat_destino")) 
+viajes_dist_21 <- merge(viajes_dist_21, mat_straight_21_table, by = c("id_hogar", "zat_origen")) 
+viajes_dist_22 <- merge(viajes_dist_22, mat_straight_22_table, by = c("zat_origen", "zat_destino")) 
+
+```
+
+It may be necessary to reorder columns after the merge process:
+
+```{r Reorder columns, eval = FALSE}
+viajes_dist_12 <- viajes_dist_12[,c(1,3:8,2,9:17)]
+viajes_dist_21 <- viajes_dist_21[,c(1,3:5,2,6:17)]
+viajes_dist_22 <- viajes_dist_22[,c(3:6,1,7,8,2,9:17)]
+```
+
+Now let's fill the SITP column **(24 hours)** :
+
+```{r Setting up the R5R network (for the SITP)}
+#Allocating 8 GB of memory to Java (2 GB is a minimum, adjust according to the hardware)
+options(java.parameters = "-Xmx8G")
+
+#Setting up the multimodal network. Requires a .zip archive containing the GTFS and a .pbf file with the road network.
+#It is quite long the first time (~15 min), then it reloads the previously created network.
+r5r_core <- setup_r5(data_path = paste0(getwd(), "/Data"))
+
+# set inputs
+mode <- c("WALK", "TRANSIT")
+departure_datetime <- as.POSIXct("13-05-2019 14:00:00",
+                                 format = "%d-%m-%Y %H:%M:%S")
+
+#Putting coordinates in the appropriate format for r5r
+ManzanaR5R <- cbind(as.data.frame(st_coordinates(Manzana)), Manzana$ID_HOGAR)
+colnames(ManzanaR5R) <- c("lon", "lat", "id")
+
+ZATR5R <- cbind(as.data.frame(st_coordinates(ZATCentroids)), ZATCentroids$ZAT)
+colnames(ZATR5R) <- c("lon", "lat", "id")
+```
+
+
+
+```{r Filling the trip database (SITP),eval=FALSE}
+#1-> 1 (non trips)
+viajes_dist_11$dist_sitp <- 0
+
+#1-> 2 (Hogar -> ZAT)
+viajes_dist_12_origen <- cbind(id = viajes_dist_12$id_hogar, ManzanaR5R[match(viajes_dist_12$id_hogar, ManzanaR5R$id), 1:2, drop = FALSE])
+viajes_dist_12_destino <- cbind(id = viajes_dist_12$zat_destino, ZATR5R[match(viajes_dist_12$zat_destino, ZATR5R$id), 1:2, drop = TRUE])
+
+viajes_dist_12$dist_sitp = 0
+foreach(i = 1:nrow(viajes_dist_12)) %dofuture% {
+  det <- detailed_itineraries(r5r_core = r5r_core,
+                                origins = viajes_dist_12_origen[i,],
+                                destinations = viajes_dist_12_destino[i,],
+                                mode = mode,
+                                departure_datetime = departure_datetime,
+                                max_walk_time = 180,
+                                max_trip_duration = 300,
+                                shortest_path = TRUE)
+  if(!is.na(det$total_distance[1])){
+      det <- det %>% filter(mode == "BUS")
+      viajes_dist_12$dist_sitp[i] <- sum(det$distance)
+  }
+}
+
+print(Sys.time())
+write.xlsx(viajes_dist_12, "Viajes_dist_12.xlsx")
+
+#2-> 1 (ZAT -> Hogar)
+viajes_dist_21_origen <- cbind(id = viajes_dist_21$zat_origen, ZATR5R[match(viajes_dist_21$zat_origen, ZATR5R$id), 1:2, drop = TRUE])
+viajes_dist_21_destino <-  cbind(id = viajes_dist_21$id_hogar, ManzanaR5R[match(viajes_dist_21$id_hogar, ManzanaR5R$id), 1:2, drop = FALSE])
+
+viajes_dist_21$dist_sitp = 0
+foreach(i = 1:nrow(viajes_dist_21)) %dofuture% {
+  det <- detailed_itineraries(r5r_core = r5r_core,
+                                origins = viajes_dist_21_origen[i,],
+                                destinations = viajes_dist_21_destino[i,],
+                                mode = mode,
+                                departure_datetime = departure_datetime,
+                                max_walk_time = 180,
+                                max_trip_duration = 300,
+                                shortest_path = TRUE)
+  if(!is.na(det$total_distance[1])){
+      det <- det %>% filter(mode == "BUS")
+      viajes_dist_21$dist_sitp[i] <- sum(det$distance)
+  }
+}
+
+print(Sys.time())
+write.xlsx(viajes_dist_21, "Viajes_dist_21.xlsx")
+
+#2-> 2 (ZAT -> ZAT)
+viajes_dist_22_origen <- cbind(id = viajes_dist_22$zat_origen, ZATR5R[match(viajes_dist_22$zat_origen, ZATR5R$id), 1:2, drop = TRUE])
+viajes_dist_22_destino <-  cbind(id = viajes_dist_22$zat_destino, ZATR5R[match(viajes_dist_22$zat_destino, ZATR5R$id), 1:2, drop = TRUE])
+
+viajes_dist_22$dist_sitp = 0
+foreach (i = 1:nrow(viajes_dist_22)) %dofuture% {
+  det <- detailed_itineraries(r5r_core = r5r_core,
+                                origins = viajes_dist_22_origen[i,],
+                                destinations = viajes_dist_22_destino[i,],
+                                mode = mode,
+                                departure_datetime = departure_datetime,
+                                max_walk_time = 180,
+                                max_trip_duration = 300,
+                                shortest_path = TRUE)
+  if(!is.na(det$total_distance[1])){
+      det <- det %>% filter(mode == "BUS")
+      viajes_dist_22$dist_sitp[i] <- sum(det$distance)
+  }
+}
+
+print(Sys.time())
+write.xlsx(viajes_dist_22, "Viajes_dist_22.xlsx")
+```
+
+Then we can create the final base with distances
+```{r Final distance base, eval = FALSE}
+viajes_dist <- rbind(viajes_dist_11, viajes_dist_12, viajes_dist_21, viajes_dist_22)
+
+viajes_dist$dist_real <- viajes_dist$dist_car
+
+viajes_dist$dist_real[viajes_dist$modo_principal == "TransMilenio"] <- viajes_dist$dist_transmi[viajes_dist$modo_principal == "TransMilenio"]
+
+viajes_dist$dist_real[viajes_dist$modo_principal %in% c("SITP Provisional", "SITP Zonal", "Alimentador")] <- viajes_dist$dist_sitp[viajes_dist$modo_principal %in% c("SITP Provisional", "SITP Zonal", "Alimentador")]
+
+viajes_dist$dist_real[viajes_dist$modo_principal == "A pie"] <- viajes_dist$dist_walk[viajes_dist$modo_principal == "A pie"]
+
+viajes_dist$dist_real[viajes_dist$modo_principal == "Bicicleta"] <- viajes_dist$dist_bike[viajes_dist$modo_principal == "Bicicleta"]
+```
+
+To save time in future editions of this RMD, open the trip table directly:
+
+```{r opening files}
+viajes_dist <- read.xlsx("Tables produites/21-09/ViajesEODH_dist_no_corr.xlsx")
+#viajes2_export <- read.csv("Sampling/Viajes_EODH_Dist_ZAT_10.csv")
+```
+
+We deal with intrazone length zero trips (that do not involve home) assigning it as the average of intrazone distances calculated from the sample and excluding zeros. The CEREMA method, which was explored, is not used.
+
+```{r intrazone length zero trips with the CEREMA method, eval = FALSE}
+viajes_dist <- viajes_dist %>% left_join(ZAT[,c("ZAT", "area")], by = c("zat_origen" = "ZAT"))
+viajes_dist$geometry = NULL
+viajes_dist$area[is.na(viajes_dist$area)] <-0
+viajes_dist$dist_real[viajes_dist$zat_destino == viajes_dist$zat_origen & viajes_dist$dist_real == 0] <- 0.5*sqrt(viajes_dist$area[viajes_dist$zat_destino == viajes_dist$zat_origen & viajes_dist$dist_real == 0])
+```
+
+```{r intrazone length zero trips with the mean of non zero distances method}
+viajes_dist <- viajes_dist %>% left_join(viajes2_export[,c("id_hogar", "id_persona", "id_viaje", "distAverage_correct_mean_non_zeros")], by = c("id_hogar", "id_persona", "id_viaje"))
+viajes_dist$dist_real[viajes_dist$zat_destino == viajes_dist$zat_origen & viajes_dist$dist_real == 0] <- 
+viajes_dist$distAverage_correct_mean_non_zeros[viajes_dist$zat_destino == viajes_dist$zat_origen & viajes_dist$dist_real == 0] 
+
+#We substitute one "NA" case with zero
+viajes_dist$dist_real[is.na(viajes_dist$dist_real)] <- 0
+```
+
+Finally, we control travel speed according to the mode, looking for "too fast" trips. Too fast trips are assigned a distance corresponding to max speed: 10 km/h for walking, 30 km/h for cycling, 80 km/h for motorized modes.
+
+```{r speed control} 
+#speed is calculated in km/h 
+viajes_dist$velocidad <- viajes_dist$dist_real/(1000*24*viajes_dist$duracion)
+
+#about 25% of walking trips are "too fast".
+viajes_dist$dist_real[viajes_dist$modo_principal == "A pie" & viajes_dist$velocidad > 10] <- 1000*24*viajes_dist$duracion[viajes_dist$modo_principal == "A pie" & viajes_dist$velocidad > 10]*10
+
+#about 8% of cycling trips are "too fast"
+viajes_dist$dist_real[viajes_dist$modo_principal == "Bicicleta" & viajes_dist$velocidad > 30] <- 1000*24*viajes_dist$duracion[viajes_dist$modo_principal == "Bicicleta" & viajes_dist$velocidad > 30]*30
+
+#about 1% of motorized trips are "too fast"
+viajes_dist$dist_real[!(viajes_dist$modo_principal %in% c("A pie","Bicicleta")) & viajes_dist$velocidad > 80] <- 1000*24*viajes_dist$duracion[!(viajes_dist$modo_principal %in% c("A pie","Bicicleta")) & viajes_dist$velocidad > 80]*80
+```
+
+```{r Exporting the trip table} 
+write.xlsx(viajes_dist, "Viajes_dist.xlsx") 
+```
+
+Surprisingly, walking trip distances are overestimated if we do not take "overspeed" into account. Indeed, **25% of walking trips are "too fast"**, representing an overevaluation of 13 million people-km. The following figures corrects this. However, the comparison with the straight line is now more complex as shown on the following method comparison histogram. It seems that the survey includes too many "too long-too fast" walking trips.
+
+We find a **total distance of 108,743,446 people-km** to be compared with **99,195,792 people-km in a straight line (+9.6%)**. 
+
+Alternatively, these would be the distances if 100% of the trips were made with only one of the following modes :
+
+```{r print Dist}
+dist_table <- as.matrix(viajes_dist[,12:18])
+dist <- as.data.frame(t(viajes_dist$f_exp %*% dist_table /1000))
+colnames(dist) <- "distance"
+
+print(dist)
+```
+
+Transmilenio gives higher distances mainly because its network is poorly connected and therefore it generates long detours, despite a huge number of zeros (27%). SITP has also a high share of zeros (31%) due to impossible itineraries.
+
+Now we can display the distance by mode:
+
+```{r Graph}
+modal <- viajes_dist %>% group_by(modo_principal) %>% summarize(distStraight = sum(f_exp*dist_straight)/1000, distReal = sum(f_exp*dist_real)/1000)
+
+modal$modo <- c("A pie", "BRT", "Auto", "Bicicleta", "Mototaxi o \n bicitaxi", "BRT", "Intermunicipal", "Moto", "Otro", "Otro", "SITP Zonal \n o Provisional", "SITP Zonal \n o Provisional", "BRT", "Escolar", "Transporte informal", "Taxi")
+
+modal_comparado <- modal %>% group_by(modo) %>% summarize(distReal = sum(distReal), distStraight = sum(distStraight))
+
+ggplot(modal_comparado, aes(reorder(modo, -distReal), distReal))+
+  theme_bw()+
+  geom_col(fill = 'royalblue')+
+  scale_y_continuous(breaks = c(0,5000000,10000000,15000000,20000000,25000000,30000000), labels = c("0", "5", "10", "15", "20", "25", "30"))+
+  labs(x="Modo principal", y = "PKT (millones de viajeros.km/día)")+
+  theme(axis.text.x = element_text(angle = 15, vjust = 0.5, hjust=0.3))
+
+data <- data.frame(
+  modo = rep(modal_comparado$modo,2),
+  dist = c(modal_comparado$distReal, modal_comparado$distStraight),
+  metodo = c(rep("Red vial", 12), rep("Línea recta",12))
+)
+
+ggplot(data, aes(fill=metodo, y=reorder(modo, -dist), x=dist)) + 
+  geom_bar(position="dodge", stat="identity") +
+  coord_flip() +
+  theme_bw() +
+  scale_x_continuous(breaks = c(0,5000000,10000000,15000000,20000000,25000000,30000000), labels = c("0", "5", "10", "15", "20", "25", "30"))+
+  labs(x="PKT (millones de viajeros.km/día)", y = "Modo principal", fill = "Metodo") +
+  scale_fill_manual(values = c("skyblue", "royalblue"))+
+  theme(axis.text.x = element_text(angle = 15, vjust = 0.5, hjust=0.3))
+```
+
+
+# Trip examples
+
+## Regular case
+
+Most of the computations gives suitable results. Let's show some examples.
+
+```{r Example 1}
+u1 = st_geometry(ZATCentroids[ZATCentroids$ZAT == 472,])
+u2 = st_geometry(Manzana[Manzana$ID_HOGAR == 10955,])
+
+#Computing the shortest path with Transmi
+paths = st_network_paths(net_transmi, from = u1, to = u2, weights = "weight")
+
+paths_transmi = net_transmi %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_transmi$mode = "Transmilenio"
+
+paths_transmi_stops = net_transmi %>%
+  activate("nodes") %>%
+  slice(unlist(paths$node_paths)) %>%
+  st_as_sf()
+
+#Computing the shortest path by the SITP
+u1R5R = ZATR5R[ZATR5R$id == 472,]
+u2R5R = ManzanaR5R[ManzanaR5R$id == 10955,]
+
+paths_sitp <- detailed_itineraries(r5r_core = r5r_core,
+                            origins = u1R5R,
+                            destinations = u2R5R,
+                            mode = mode,
+                            departure_datetime = departure_datetime,
+                            max_walk_time = 120,
+                            max_trip_duration = 240,
+                            shortest_path = TRUE)
+paths_sitp <- paths_sitp %>% filter(mode=="BUS")
+
+#Displaying the result
+displayed_net <- st_as_sf(net_transmi, "edges")
+displayed_stops <- st_as_sf(net_transmi, "nodes")
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = displayed_net, colour = "grey")+
+  geom_sf(data = displayed_stops, colour = "grey") +
+  geom_sf(data = paths_transmi, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_transmi_stops, colour = palette[4], linewidth = 1.2) +
+  geom_sf(data = paths_sitp, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-74.15,-74), ylim = c(4.5,4.75),datum = NA)+
+  scale_colour_manual(values = palette[3:4], labels = c("SITP", "TRANSMILENIO"))+
+  labs(title = "Trayecto en SITP sin problema") +
+  annotation_scale(location = "br") +
+  annotation_north_arrow(location = "tl", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Transmi : ", st_network_cost(net_transmi, from = u1, to = u2, weights = "weight")))
+print(paste0("SITP : ", unique(paths_sitp$total_distance)))
+```
+
+```{r Example 2}
+u1 = st_geometry(ZATCentroids[ZATCentroids$ZAT == 472,])
+u2 = st_geometry(Manzana[Manzana$ID_HOGAR == 10955,])
+
+#Computing the shortest path with the road network (all modes)
+
+verts <- dodgr_vertices(net_cycl)
+dp <- dodgr_paths(net_mot, from = st_coordinates(u1), to = st_coordinates(u2))
+paths_mot <- verts[match (dp [[1]] [[1]], verts$id), ] %>% 
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  group_by(component) %>%
+  summarize(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+
+paths_mot$mode = "Auto"
+
+dp <- dodgr_paths(net_cycl, from = st_coordinates(u1), to = st_coordinates(u2))
+paths_bike <- verts[match (dp [[1]] [[1]], verts$id), ] %>% 
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  group_by(component) %>%
+  summarize(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+
+paths_bike$mode = "Bicicleta"
+
+dp <- dodgr_paths(net_walk, from = st_coordinates(u1), to = st_coordinates(u2))
+paths_walk <- verts[match (dp [[1]] [[1]], verts$id), ] %>% 
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  group_by(component) %>%
+  summarize(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+
+paths_walk$mode = "A pie"
+
+ 
+#Displaying the result
+displayed_net <- st_as_sf(net_transmi, "edges")
+displayed_stops <- st_as_sf(net_transmi, "nodes")
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = displayed_net, colour = "grey")+
+  geom_sf(data = displayed_stops, colour = "grey") +
+  geom_sf(data = paths_mot, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_walk, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_bike, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-74.15,-74), ylim = c(4.5,4.75),datum = NA)+
+  scale_colour_manual(values = palette[3:5])+
+  labs(title = "Trayecto por la red vial sin problema") +
+  annotation_scale(location = "br") +
+  annotation_north_arrow(location = "tl", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Walk : ", st_length(paths_walk)))
+print(paste0("Bike : ", st_length(paths_bike)))
+print(paste0("Car : ", st_length(paths_mot)))
+```
+
+
+## Problems
+
+Here are some of the limits we found.
+
+The first case is found when _dist_transmi_ >> _dist_bike_ (or any other private mode, using the road network).
+In the following example, we see a trip outside the capital district. It is therefore poorly served by Transmilenio. However, the real trip in the table was made with bike and the calculated shortest path is more reliable.
+
+```{r Problematic case 1}
+u1 = st_geometry(ZATCentroids[ZATCentroids$ZAT == 1806,])
+u2 = st_geometry(Manzana[Manzana$ID_HOGAR == 14905,])
+
+#Computing the shortest path with Transmi
+paths = st_network_paths(net_transmi, from = u1, to = u2, weights = "weight")
+
+paths_transmi = net_transmi %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_transmi$mode = "Transmilenio"
+
+paths_transmi_stops = net_transmi %>%
+  activate("nodes") %>%
+  slice(unlist(paths$node_paths)) %>%
+  st_as_sf()
+
+#Computing the shortest path by the road (mode = bike)
+verts <- dodgr_vertices(net_cycl)
+dp <- dodgr_paths(net_cycl, from = st_coordinates(u1), to = st_coordinates(u2))
+paths_bike <- verts[match (dp [[1]] [[1]], verts$id), ] %>% 
+  st_as_sf(coords = c("x", "y"), crs = 4326) %>%
+  group_by(component) %>%
+  summarize(do_union = FALSE) %>%
+  st_cast("LINESTRING")
+
+paths_bike$mode = "Bicicleta"
+
+#Displaying the result
+colors = sf.colors(2, categorical = TRUE)
+displayed_net <- st_as_sf(net_transmi, "edges")
+displayed_stops <- st_as_sf(net_transmi, "nodes")
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = displayed_net, colour = "grey")+
+  geom_sf(data = displayed_stops, colour = "grey") +
+  geom_sf(data = paths_transmi, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_transmi_stops, colour = palette[4], linewidth = 1.2) +
+  geom_sf(data = paths_bike, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-74.4,-74.05), ylim = c(4.6,4.9),datum = NA)+
+  scale_colour_manual(values = palette[3:4])+
+  labs(title = "Caso 1: Trayecto fuera de Bogotá DC realizado en bicicleta") +
+  annotation_scale(location = "br") +
+  annotation_north_arrow(location = "tl", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Transmi : ", st_network_cost(net_transmi, from = u1, to = u2, weights = "weight")))
+print(paste0("Bike : ", st_length(paths_bike)))
+```
+The second problematic case is a trip realized in Transmilenio which in fact leaves Bogotá DC, for which _R5R_ cannot compute any route. Therefore, for this trip, _dist_transmi_ is underestimated, and _dist_sitp_ is 0.
+
+```{r Problematic case 2}
+u1 = st_geometry(Manzana[Manzana$ID_HOGAR == 10653,])
+u2 = st_geometry(ZATCentroids[ZATCentroids$ZAT == 910,])
+
+#Computing the shortest path with Transmi
+paths = st_network_paths(net_transmi, from = u1, to = u2, weights = "weight")
+
+paths_transmi = net_transmi %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_transmi$mode = "Transmilenio"
+
+paths_transmi_stops = net_transmi %>%
+  activate("nodes") %>%
+  slice(unlist(paths$node_paths)) %>%
+  st_as_sf()
+
+#Computing the shortest path by the SITP
+u1R5R = ManzanaR5R[ManzanaR5R$id == 10653,]
+u2R5R = ZATR5R[ZATR5R$id == 910,]
+
+paths_sitp <- detailed_itineraries(r5r_core = r5r_core,
+                            origins = u1R5R,
+                            destinations = u2R5R,
+                            mode = mode,
+                            departure_datetime = departure_datetime,
+                            max_walk_time = 120,
+                            max_trip_duration = 240,
+                            shortest_path = TRUE)
+
+#Displaying the result
+displayed_net <- st_as_sf(net_transmi, "edges")
+displayed_stops <- st_as_sf(net_transmi, "nodes")
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = displayed_net, colour = "grey")+
+  geom_sf(data = displayed_stops, colour = "grey") +
+  geom_sf(data = paths_transmi, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_transmi_stops, colour = palette[3], linewidth = 1.2) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-74.3,-74), ylim = c(4.46,5.1),datum = NA)+
+  scale_colour_manual(values = palette[3:4])+
+  labs(title = "Caso 2: Trayecto saliendo de Bogotá DC \n realizado en Transmilenio") +
+  annotation_scale(location = "br") +
+  annotation_north_arrow(location = "tl", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Transmi : ", st_network_cost(net_transmi, from = u1, to = u2, weights = "weight")))
+print(paste0("SITP : ", st_length(paths_sitp)))
+```
+
+A third problematic case is for a trip crossing all the district from north to south whose declared mode was SITP Zonal. The problem here is that R5R computes the fastest transit route, which uses Transmilenio, so both paths overlap.
+
+```{r Problematic case 3}
+u1 = st_geometry(ZATCentroids[ZATCentroids$ZAT == 28,])
+u2 = st_geometry(Manzana[Manzana$ID_HOGAR == 6914,])
+
+#Computing the shortest path with Transmi
+paths = st_network_paths(net_transmi, from = u1, to = u2, weights = "weight")
+
+paths_transmi = net_transmi %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_transmi$mode = "Transmilenio"
+
+paths_transmi_stops = net_transmi %>%
+  activate("nodes") %>%
+  slice(unlist(paths$node_paths)) %>%
+  st_as_sf()
+
+#Computing the shortest path by the SITP
+u1R5R = ZATR5R[ZATR5R$id == 29,]
+u2R5R = ManzanaR5R[ManzanaR5R$id == 6914,]
+
+paths_sitp <- detailed_itineraries(r5r_core = r5r_core,
+                            origins = u1R5R,
+                            destinations = u2R5R,
+                            mode = mode,
+                            departure_datetime = departure_datetime,
+                            max_walk_time = 120,
+                            max_trip_duration = 240,
+                            shortest_path = TRUE)
+paths_sitp <- paths_sitp %>% filter(mode=="BUS")
+
+#Displaying the result
+displayed_net <- st_as_sf(net_transmi, "edges")
+displayed_stops <- st_as_sf(net_transmi, "nodes")
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = displayed_net, colour = "grey")+
+  geom_sf(data = displayed_stops, colour = "grey") +
+  geom_sf(data = paths_transmi, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_transmi_stops, colour = palette[4], linewidth = 1.2) +
+  geom_sf(data = paths_sitp, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-74.3,-74), ylim = c(4.46,4.82),datum = NA)+
+  scale_colour_manual(values = palette[3:4], labels = c("SITP", "TRANSMILENIO"))+
+  labs(title = "Caso 3: Trayecto atravesando Bogotá DC \n realizado en Transmilenio") +
+  annotation_scale(location = "br") +
+  annotation_north_arrow(location = "tl", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Transmi : ", st_network_cost(net_transmi, from = u1, to = u2, weights = "weight")))
+print(paste0("SITP : ", unique(paths_sitp$total_distance)))
+```
+
+A fourth problematic case is a trip made by SITP but out of reach of Transmilenio. Unlike case 1, both start and end points are snapped to the same Transmilenio station, so _dist_transmi_ = 0.
+
+```{r Problematic case 4}
+u1 = st_geometry(ZATCentroids[ZATCentroids$ZAT == 732,])
+u2 = st_geometry(Manzana[Manzana$ID_HOGAR == 17585,])
+
+#Computing the shortest path with Transmi
+paths = st_network_paths(net_transmi, from = u1, to = u2, weights = "weight")
+
+paths_transmi = net_transmi %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_transmi$mode = "Transmilenio"
+
+paths_transmi_stops = net_transmi %>%
+  activate("nodes") %>%
+  slice(unlist(paths$node_paths)) %>%
+  st_as_sf()
+
+#Computing the shortest path by the SITP
+u1R5R = ZATR5R[ZATR5R$id == 732,]
+u2R5R = ManzanaR5R[ManzanaR5R$id == 17585,]
+
+paths_sitp <- detailed_itineraries(r5r_core = r5r_core,
+                            origins = u1R5R,
+                            destinations = u2R5R,
+                            mode = mode,
+                            departure_datetime = departure_datetime,
+                            max_walk_time = 120,
+                            max_trip_duration = 240,
+                            shortest_path = TRUE)
+paths_sitp <- paths_sitp %>% filter(mode=="BUS")
+
+#Displaying the result
+displayed_net <- st_as_sf(net_transmi, "edges")
+displayed_stops <- st_as_sf(net_transmi, "nodes")
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = displayed_net, colour = "grey")+
+  geom_sf(data = displayed_stops, colour = "grey") +
+  geom_sf(data = paths_transmi, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_transmi_stops, colour = palette[4], linewidth = 1.2) +
+  geom_sf(data = paths_sitp, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-74.3,-74), ylim = c(4.46,4.6),datum = NA)+
+  scale_colour_manual(values = palette[3:4], labels = c("SITP", "TRANSMILENIO"))+
+  labs(title = "Caso 4: Trayecto en SITP fuera del alcance de Transmilenio") +
+  annotation_scale(location = "br") +
+  annotation_north_arrow(location = "tl", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Transmi : ", st_network_cost(net_transmi, from = u1, to = u2, weights = "weight")))
+print(paste0("SITP : ", unique(paths_sitp$total_distance)))
+```
+
+A fifth problematic case is a "regular" trip but for which _R5R_ includes the whole uncut SITP route instead of the mere ridden part.
+
+```{r Problematic case 5}
+u1 = st_geometry(ZATCentroids[ZATCentroids$ZAT == 522,])
+u2 = st_geometry(Manzana[Manzana$ID_HOGAR == 2024,])
+
+#Computing the shortest path with Transmi
+paths = st_network_paths(net_transmi, from = u1, to = u2, weights = "weight")
+
+paths_transmi = net_transmi %>%
+  activate("edges") %>%
+  slice(unlist(paths$edge_paths)) %>%
+  st_as_sf()
+
+paths_transmi$mode = "Transmilenio"
+
+paths_transmi_stops = net_transmi %>%
+  activate("nodes") %>%
+  slice(unlist(paths$node_paths)) %>%
+  st_as_sf()
+
+#Computing the shortest path by the SITP
+u1R5R = ZATR5R[ZATR5R$id == 522,]
+u2R5R = ManzanaR5R[ManzanaR5R$id == 2024,]
+
+paths_sitp <- detailed_itineraries(r5r_core = r5r_core,
+                            origins = u1R5R,
+                            destinations = u2R5R,
+                            mode = mode,
+                            departure_datetime = departure_datetime,
+                            max_walk_time = 120,
+                            max_trip_duration = 240,
+                            shortest_path = TRUE)
+paths_sitp <- paths_sitp %>% filter(mode=="BUS")
+
+#Displaying the result
+displayed_net <- st_as_sf(net_transmi, "edges")
+displayed_stops <- st_as_sf(net_transmi, "nodes")
+
+palette = sf.colors(6, categorical = TRUE)
+
+ggplot()+
+  theme_bw()+
+  geom_sf(data = contour, colour = "black", fill = NA) +
+  geom_sf(data = displayed_net, colour = "grey")+
+  geom_sf(data = displayed_stops, colour = "grey") +
+  geom_sf(data = paths_transmi, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = paths_transmi_stops, colour = palette[4], linewidth = 1.2) +
+  geom_sf(data = paths_sitp, aes(colour = mode), linewidth = 0.6) +
+  geom_sf(data = u1, col = palette[1], pch = 8, size = 6, stroke = 2)+
+  geom_sf(data = u2, col = palette[2], pch = 8, size = 6, stroke = 2)+
+  coord_sf(crs= "WGS84", xlim = c(-74.2,-74), ylim = c(4.46,4.7),datum = NA)+
+  scale_colour_manual(values = palette[3:4], labels = c("SITP", "TRANSMILENIO"))+
+  labs(title = "Caso 5: Trayecto en SITP que no corta") +
+  annotation_scale(location = "br") +
+  annotation_north_arrow(location = "tl", which_north = "true")
+
+#Displaying the distance (in m)
+print(paste0("Transmi : ", st_network_cost(net_transmi, from = u1, to = u2, weights = "weight")))
+print(paste0("SITP : ", unique(paths_sitp$total_distance)))
+```
+
+# Further work
+
+Build a graph explaining all the process for both Bogotá and  Lima.
+
+## Discussion
+
+* Replace ZAT centroids by a sampling with different start and end points so that intra-ZAT trips are not equal to zero? (only 10% of the trip database, for trips that do not start or end in the household).
+* Check for too fast trips and remove them (e.g. walk above 10 km/h, etc.).
+* Check for too long SITP trips (to address Problem 5).
