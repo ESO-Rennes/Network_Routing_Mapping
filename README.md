@@ -22,7 +22,7 @@ The first scripts do the following:
 Please find below:
 
 * The R script for [Bogotá](Bogota_Routing_Distance_4.Rmd) and [Lima](Lima_Routing_Distance_v2.Rmd).
-* The HTML rendering for [Bogotá](Bogota_Routing_Distance_4.html) and [Lima](Lima_Routing_Distance_v2.html).
+* The HTML rendering for [Bogotá](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Bogota_Routing_Distance_4.html) and [Lima](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Lima_Routing_Distance_v2.html).
 * The data used in this project for [Bogotá](https://bit.ly/42mtehp) and [Lima](https://bit.ly/3Ou7fzh).
 
 # Producing original maps of mobility demand, greenhouse gas and air pollution emissions
@@ -42,7 +42,7 @@ In a second time, distance-based indicators were produced and mapped in [Bogotá
 
  Please find below:
 * The R script for [Bogotá](Bogota_Distance_Mapping_EN.Rmd) and [Lima](Lima_Distance_Mapping_EN.Rmd).
-* The HTML rendering for [Bogotá](Bogota_Distance_Mapping_EN.html) and [Lima](Lima_Distance_Mapping_EN.html).
+* The HTML rendering for [Bogotá](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Bogota_Distance_Mapping_EN.html) and [Lima](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Lima_Distance_Mapping_EN.html).
 
 
   
