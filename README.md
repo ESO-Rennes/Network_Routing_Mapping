@@ -2,7 +2,7 @@
 
 This work was carried out by [Hugo Thomas](https://perso.univ-rennes2.fr/hugo.thomas) and [Florent Demoraes](https://perso.univ-rennes2.fr/florent.demoraes) at the CNRS ESO research unit in Rennes (France), between June and December 2023. This study is part of a PhD thesis developed by Hugo Thomas (Université Rennes 2, France / Universidad de los Andes, Colombia) and also part of the activities of the [Modural program](https://modural.hypotheses.org/le-projet) funded by the French National Research Agency. The methods developed in R and applied to Bogotá and Lima are replicable to other urban areas and other mobility surveys using other travel modes.
 
-![PKT Bogota](Bogota Smoothed map total distance-1.png) 
+![Bogota Smoothed map total distance-1.png](https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Bogota%20Smoothed%20map%20total%20distance-1.png)
 
 # Routing shortest path distance in road and public transport networks
 
