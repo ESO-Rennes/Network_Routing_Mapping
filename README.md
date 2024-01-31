@@ -36,6 +36,10 @@ In a second time, distance-based indicators were produced and mapped in [Bogotá
 * Total daily emissions of the pollowing air pollutants: CO, NOx, PM.2.5.
 * Air pollutants emissions per capita.
 
+![Bogota Smoothed map car distance-1.png](https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Bogota%20Smoothed%20map%20car%20distance-1.png)
+
+![Lima Smoothed map car distance-1.png](https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Lima%20Smoothed%20map%20car%20distance-1.png)
+
  Please find below:
 * The R script for [Bogotá](Bogota_Distance_Mapping_EN.Rmd) and [Lima](Lima_Distance_Mapping_EN.Rmd).
 * The HTML rendering for [Bogotá](Bogota_Distance_Mapping_EN.html) and [Lima](Lima_Distance_Mapping_EN.html).
