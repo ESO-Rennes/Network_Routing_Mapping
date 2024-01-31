@@ -8,7 +8,7 @@ This work was carried out by [Hugo Thomas](https://perso.univ-rennes2.fr/hugo.th
 
 # Routing shortest path distance in road and public transport networks
 
-This repository contains scripts and data to carry out network-based distance computation based on a Household Travel Survey conducted in 2019 (HMS 2019) in Bogotá, and a Household Travel Survey conducted in 2012 (HMS 2012) in Lima. The analysis uses database representing 22,000 households and 120,000 trips in each city, as well as road and public transport networks downloaded from OpenStreetMap or open data repositories. The main outputs of this section are the trips databases of both cities with an additional variable accounting for the length of  each trip. 
+This repository contains scripts and data to carry out network-based distance computation based on a Household Travel Survey conducted in 2019 (HMS 2019) in Bogotá, and a Household Travel Survey conducted in 2012 (HMS 2012) in Lima. The analysis uses databases representing approx. 22,000 households and 120,000 trips in each city, as well as road and public transport networks downloaded from OpenStreetMap or open data repositories. The main outputs of this section are the trips databases of both cities with an additional variable accounting for the length of  each trip. 
 
 The first scripts do the following:
 
@@ -16,7 +16,7 @@ The first scripts do the following:
 * Providing a sensibility test of the location of the start and end point in each ZAT.
 * Discussing the impact of the main mode assignation.
 * Computing distance for each trip on the database, for all possible modes.
-* Producing basic statistics about distance in Lima.
+* Producing basic statistics about distance and passengers-kilometers traveled (PKT).
 * Showing trip examples and discussing routing issues.
 
 Please find below:
@@ -27,7 +27,7 @@ Please find below:
 
 # Producing original maps of mobility demand, greenhouse gas and air pollution emissions
 
-In a second time, distance-based indicators were produced and mapped in [Bogotá](Bogota_Distance_Mapping_EN.Rmd) and [Lima](Lima_Distance_Mapping_EN.Rmd) using spatial smoothing to seek visual effectiveness. We included indicators such as:
+In a second time, distance-based indicators were produced and mapped using spatial smoothing to seek visual effectiveness. We included indicators such as:
 
 * Total passengers-kilometers traveled (PKT) per day according to the place of residence and the trip purpose.
 * Average distance per capita according to the place of residence and the main mode.
