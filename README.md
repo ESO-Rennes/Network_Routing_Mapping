@@ -1,3 +1,50 @@
+----- VERSION EN ESPAÑOL -----
+
+Este trabajo fue realizado por [Hugo Thomas](https://perso.univ-rennes2.fr/hugo.thomas) y [Florent Demoraes](https://perso.univ-rennes2.fr/florent.demoraes) en la unidad de investigación ESO CNRS en Rennes (Francia), entre junio y diciembre de 2023. Este estudio es parte de la tesis doctoral de Hugo Thomas (Université Rennes 2, Francia / Universidad de los Andes, Colombia) así como de las actividades del [programa Modural](https://modural.hypotheses.org/le-projet-modural/el-proyecto) con recursos de la Agencial Nacional de Investigación Francesa (ANR). Los métodos desarrollados en R y aplicados a Bogotá y Lima son replicables a otras areas urbanas y encuestas de mobilidad abarcando otros modos de transporte.
+
+![Bogota Smoothed map total distance-1.png](https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Bogota%20Smoothed%20map%20total%20distance-1.png)
+
+![Lima Smoothed map total distance-1.png](https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Lima%20Smoothed%20map%20total%20distance-1.png)
+
+# Cálculo de la distancia por el camino más corto en la red vvial y la red de transporte público
+
+Este repositorio contiene scripts y datos para calcular distancias por la red vial y la red de transporte público basadas en la Encuesta Origen-Destino de Hogares de 2019 (EODH 2019) en Bogotá y la Encuesta Origen-Destino de Hogares de 2012 (EODH 2012) en Lima. El análisis utiliza bases de datos de approx. 22,000 hogares y 120,000 viajes en cada ciudad, así como redes vial y de transporte público bajados de OpenStreetMap u otros repositorios de datos abiertos. Los principales productos de esta sección son las bases de viajes de cada ciudad con una variable adicional marcando la distancia de cada viaje.
+
+Los primeros scripts hacen lo siguiente:
+
+* Contar el número de acontecimientos de cada par OD en la base de viajes, y producir un mapa de calor.
+* Realizar un análisis de sensibilidad de la ubicación de los puntos de inicio y fin de recorrido en cada ZAT.
+* Discutir el impacto del método de asignación del modo principal.
+* Calcular la distancia de cada viaje en la base, para todos los modos existentes.
+* Producir estadística básica acerca de la distancia y los pasajeros-kilómetros recorridos (PKT).
+* Mostrar ejemplos de viajes y discutir algunas cuestiones de enrutamiento.
+
+Abajo encontrará:
+
+* El script R para [Bogotá](Bogota_Routing_Distance_4.Rmd) y [Lima](Lima_Routing_Distance_v2.Rmd).
+* El archivo HTML para [Bogotá](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Bogota_Routing_Distance_4.html) y [Lima](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Lima_Routing_Distance_v2.html).
+* Los datos utilizados para [Bogotá](https://bit.ly/42mtehp) y [Lima](https://bit.ly/3Ou7fzh).
+
+# Producción de mapas originales de la demanda de mobilidad y las emisiones de gases de efecto invernadero (GEI) y contaminantes aéreos
+
+En un segundo tiempo, se produjo y mapeó indicadores basados en la distancia utilizando lisado espacial (spatial smoothing), buscando la eficiencia visual para el lector. Los indicadores calculados abarcan:
+
+* Pasajeros-kilómetros totales (PKT) por día, dependiendo del lugar de residencia y del motivo de viaje.
+* Distancia promedio per cápita dependiendo del lugar de residencia y del modo principal.
+* Emisiones de GEI totales por día.
+* Emisiones de GEI per cápita.
+* Emisiones cotidianas totales de los siguientes contaminantes aéreos: CO, NOx, PM.2.5.
+* Emisiones de contaminantes aéreos per cápita.
+
+![Bogota Smoothed map car distance-1.png](https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Bogota%20Smoothed%20map%20car%20distance-1.png)
+
+![Lima Smoothed map car distance-1.png](https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Lima%20Smoothed%20map%20car%20distance-1.png)
+
+Abajo encontrará:
+* El script R para [Bogotá](Bogota_Distance_Mapping_EN.Rmd) y [Lima](Lima_Distance_Mapping_EN.Rmd).
+* El archivo HTML para [Bogotá](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Bogota_Distance_Mapping_EN.html) y [Lima](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Lima_Distance_Mapping_EN.html).
+
+
 ----- ENGLISH VERSION -----
 
 This work was carried out by [Hugo Thomas](https://perso.univ-rennes2.fr/hugo.thomas) and [Florent Demoraes](https://perso.univ-rennes2.fr/florent.demoraes) at the CNRS ESO research unit in Rennes (France), between June and December 2023. This study is part of a PhD thesis developed by Hugo Thomas (Université Rennes 2, France / Universidad de los Andes, Colombia) and also part of the activities of the [Modural program](https://modural.hypotheses.org/le-projet) funded by the French National Research Agency. The methods developed in R and applied to Bogotá and Lima are replicable to other urban areas and other mobility surveys using other travel modes.
