@@ -6,7 +6,7 @@ Este trabajo fue realizado por [Hugo Thomas](https://perso.univ-rennes2.fr/hugo.
 
 ![Lima Smoothed map total distance-1.png](https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Lima%20Smoothed%20map%20total%20distance-1.png)
 
-# Cálculo de la distancia por el camino más corto en la red vvial y la red de transporte público
+# Cálculo de la distancia por el camino más corto en la red vial y la red de transporte público
 
 Este repositorio contiene scripts y datos para calcular distancias por la red vial y la red de transporte público basadas en la Encuesta Origen-Destino de Hogares de 2019 (EODH 2019) en Bogotá y la Encuesta Origen-Destino de Hogares de 2012 (EODH 2012) en Lima. El análisis utiliza bases de datos de approx. 22,000 hogares y 120,000 viajes en cada ciudad, así como redes vial y de transporte público bajados de OpenStreetMap u otros repositorios de datos abiertos. Los principales productos de esta sección son las bases de viajes de cada ciudad con una variable adicional marcando la distancia de cada viaje.
 
@@ -44,6 +44,10 @@ Abajo encontrará:
 * El script R para [Bogotá](Bogota_Distance_Mapping_EN.Rmd) y [Lima](Lima_Distance_Mapping_EN.Rmd).
 * El archivo HTML para [Bogotá](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Bogota_Distance_Mapping_EN.html) y [Lima](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Lima_Distance_Mapping_EN.html).
 
+
+# Palabras clave
+
+_mobilidad cotidiana; encuesta de movilidad de hogares; script R; cálculo de distancia por la red vial; pasajeros-kilómetro recorridos; emisiones de GEI; contaminación del aire_
 
 ----- ENGLISH VERSION -----
 
