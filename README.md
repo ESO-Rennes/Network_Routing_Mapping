@@ -25,7 +25,7 @@ Abajo encontrará:
 * El archivo HTML para [Bogotá](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Bogota_Routing_Distance_4.html) y [Lima](https://htmlpreview.github.io/?https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Lima_Routing_Distance_v2.html).
 * Los datos utilizados para [Bogotá](https://bit.ly/42mtehp) y [Lima](https://bit.ly/3Ou7fzh).
 
-# Producción de mapas originales de la demanda de mobilidad y las emisiones de gases de efecto invernadero (GEI) y contaminantes aéreos
+# Producción de mapas originales de la demanda de movilidad y las emisiones de gases de efecto invernadero (GEI) y contaminantes aéreos
 
 En un segundo tiempo, se produjo y mapeó indicadores basados en la distancia utilizando lisado espacial (spatial smoothing), buscando la eficiencia visual para el lector. Los indicadores calculados abarcan:
 
