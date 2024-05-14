@@ -1,6 +1,6 @@
 ----- VERSION EN ESPAÑOL -----
 
-Este trabajo fue realizado por [Hugo Thomas](https://perso.univ-rennes2.fr/hugo.thomas) y [Florent Demoraes](https://perso.univ-rennes2.fr/florent.demoraes) en la unidad de investigación ESO CNRS en Rennes (Francia), entre junio y diciembre de 2023. Este estudio es parte de la tesis doctoral de Hugo Thomas (Université Rennes 2, Francia / Universidad de los Andes, Colombia) así como de las actividades del [programa Modural](https://modural.hypotheses.org/le-projet-modural/el-proyecto) con recursos de la Agencial Nacional de Investigación Francesa (ANR). Los métodos desarrollados en R y aplicados a Bogotá y Lima son replicables a otras areas urbanas y encuestas de mobilidad abarcando otros modos de transporte.
+Este trabajo fue realizado por [Hugo Thomas](https://perso.univ-rennes2.fr/hugo.thomas) y [Florent Demoraes](https://perso.univ-rennes2.fr/florent.demoraes) en la unidad de investigación ESO CNRS en Rennes (Francia), entre junio y diciembre de 2023. Este estudio es parte de la tesis doctoral de Hugo Thomas (Université Rennes 2, Francia / Universidad de los Andes, Colombia) así como de las actividades del [programa Modural](https://modural.hypotheses.org/le-projet-modural/el-proyecto) con recursos de la Agencial Nacional de Investigación Francesa (ANR). Los métodos desarrollados en R y aplicados a Bogotá y Lima son replicables a otras areas urbanas y encuestas de movilidad abarcando otros modos de transporte.
 
 ![Bogota Smoothed map total distance-1.png](https://github.com/ESO-Rennes/Network_Routing_Mapping/blob/main/Bogota%20Smoothed%20map%20total%20distance-1.png)
 
@@ -47,7 +47,7 @@ Abajo encontrará:
 
 # Palabras clave
 
-_mobilidad cotidiana; encuesta de movilidad de hogares; script R; cálculo de distancia por la red vial; pasajeros-kilómetro recorridos; emisiones de GEI; contaminación del aire_
+_movilidad cotidiana; encuesta de movilidad de hogares; script R; cálculo de distancia por la red vial; pasajeros-kilómetro recorridos; emisiones de GEI; contaminación del aire_
 
 ----- ENGLISH VERSION -----
 
